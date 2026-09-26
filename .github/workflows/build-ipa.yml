@@ -1,0 +1,146 @@
+name: Build EdgeReturn IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      export_method:
+        description: "Export method (development / ad-hoc / release)"
+        required: false
+        default: "development"
+  push:
+    branches: [ main ]
+
+env:
+  KEYCHAIN_NAME: "edgeReturn-signing"
+  KEYCHAIN_PASSWORD: "edgeReturn-2024"
+  SCHEME: "EdgeReturn"
+  PROJECT: "EdgeReturn.xcodeproj"
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          xcode-select -p
+
+      - name: Install XcodeGen
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen || true
+          fi
+          xcodegen --version
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Decode signing assets
+        env:
+          CERTIFICATE_P12: ${{ secrets.CERTIFICATE_P12 }}
+          PROVISIONING_PROFILE: ${{ secrets.PROVISIONING_PROFILE }}
+        run: |
+          set -e
+          mkdir -p ~/signing
+          echo "${{ secrets.CERTIFICATE_P12 }}" | base64 --decode > ~/signing/cert.p12
+          echo "${{ secrets.PROVISIONING_PROFILE }}" | base64 --decode > ~/signing/profile.mobileprovision
+          ls -la ~/signing
+
+      - name: Import certificate & profile
+        env:
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+        run: |
+          set -e
+          KEYCHAIN_PATH=$RUNNER_TEMP/$KEYCHAIN_NAME.keychain-db
+
+          # Fresh signing keychain
+          if [ -f "$KEYCHAIN_PATH" ]; then rm -f "$KEYCHAIN_PATH"; fi
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-attrs "$KEYCHAIN_PATH" -u
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import the P12 (certificate + private key)
+          security import ~/signing/cert.p12 \
+            -P "$P12_PASSWORD" \
+            -t cert \
+            -k "$KEYCHAIN_PATH"
+          # Allow the key to be used for code signing
+          security set-key-partition-list -S signing -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Make it the default and part of the search list
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"' | tr '\n' ' ')
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security set-keychain-attrs "$KEYCHAIN_PATH" -u
+
+          # Install the provisioning profile
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp ~/signing/profile.mobileprovision "$HOME/Library/MobileDevice/Provisioning Profiles/"
+
+          # Extract identifiers from the profile
+          PROFILE_PLIST=$(mktemp)
+          security cms -D -i ~/signing/profile.mobileprovision > "$PROFILE_PLIST"
+          PROFILE_UUID=$(plutil -extract ProvisioningProfileUUID raw -o - "$PROFILE_PLIST")
+          TEAM_ID=$(plutil -extract TeamIdentifier.0 raw -o - "$PROFILE_PLIST")
+          NAME=$(plutil -extract Name raw -o - "$PROFILE_PLIST" || echo "EdgeReturn")
+          echo "Profile: $NAME (UUID $PROFILE_UUID, team $TEAM_ID)"
+
+          {
+            echo "PROFILE_UUID=$PROFILE_UUID"
+            echo "TEAM_ID=$TEAM_ID"
+          } >> "$GITHUB_ENV"
+
+      - name: Build (archive)
+        run: |
+          set -e
+          xcodebuild archive \
+            -project "$PROJECT" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            -archivePath build/EdgeReturn.xcarchive \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            PROVISIONING_PROFILE="$PROFILE_UUID" \
+            | tail -n 60
+
+      - name: Write export options
+        run: |
+          set -e
+          METHOD="${{ github.event.inputs.export_method || 'development' }}"
+          cat > ExportOptions.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>$METHOD</string>
+            <key>teamID</key>
+            <string>$TEAM_ID</string>
+            <key>uploadSymbols</key>
+            <true/>
+            <key>compileBitcode</key>
+            <false/>
+          </dict>
+          </plist>
+          EOF
+          cat ExportOptions.plist
+
+      - name: Export IPA
+        run: |
+          set -e
+          xcodebuild -exportArchive \
+            -archivePath build/EdgeReturn.xcarchive \
+            -optionsPlist ExportOptions.plist \
+            -outputPath build/EdgeReturn.ipa \
+            | tail -n 40
+          ls -la build/
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EdgeReturn.ipa
+          path: build/EdgeReturn.ipa

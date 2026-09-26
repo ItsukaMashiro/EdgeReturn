@@ -1,0 +1,22 @@
+# Xcode
+build/
+DerivedData/
+*.xcodeproj
+!project.yml
+*.xcworkspace
+*.xcuserdata/
+*.moved-aside
+*.swp
+*.swo
+
+# Signing assets (never commit real certs)
+*.p12
+*.mobileprovision
+*.cer
+*.crt
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
