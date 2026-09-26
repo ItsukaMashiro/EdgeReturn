@@ -58,11 +58,13 @@ jobs:
           KEYCHAIN_PATH=$RUNNER_TEMP/$KEYCHAIN_NAME.keychain-db
 
           # macOS 26 renamed `set-keychain-attrs` to `set-keychain-settings`
+          # and its parser requires flags before the keychain path
           set_keychain_attrs() {
             if security set-keychain-attrs -h >/dev/null 2>&1; then
               security set-keychain-attrs "$@"
             else
-              security set-keychain-settings "$@"
+              local path="$1"; shift
+              security set-keychain-settings "$@" "$path"
             fi
           }
 
