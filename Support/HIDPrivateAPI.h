@@ -9,7 +9,13 @@
 //
 
 #import <Foundation/Foundation.h>
-#import <IOKit/hid/IOHIDEvent.h>
+
+// IOHIDEventRef and IOHIDEventSetRef are defined in the private
+// <IOKit/hid/IOHIDEvent.h>, which is not shipped in the SDK. We only use these
+// types as opaque pointers (never accessing members), so forward-declare them
+// instead of importing the private header.
+typedef struct __IOHIDEvent *IOHIDEventRef;
+typedef struct __IOHIDEventSet *IOHIDEventSetRef;
 
 #ifdef __cplusplus
 extern "C" {
@@ -69,6 +75,12 @@ IOHIDEventRef IOHIDEventCreateDigitizerEvent(CFAllocatorRef allocator,
 
 IOHIDEventSetRef IOHIDEventCreateDigitizerEventSet(CFAllocatorRef allocator,
                                                   UInt32 maxEvents);
+
+// ---------------------------------------------------------------------------
+// Event query (private) — normally provided by <IOKit/hid/IOHIDEvent.h>
+// ---------------------------------------------------------------------------
+UInt32 IOHIDEventGetEventType(IOHIDEventRef event);
+Float32 IOHIDEventGetFloatValue(IOHIDEventRef event, Int32 field);
 
 #ifdef __cplusplus
 }

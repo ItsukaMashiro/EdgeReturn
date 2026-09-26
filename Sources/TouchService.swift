@@ -67,8 +67,8 @@ final class TouchService: NSObject {
 
     // IOKit HID field / type constants (private values).
     private let kDigitizerType: UInt32 = 13            // kIOHIDEventTypeDigitizer
-    private let kFieldX: Int = 0x100000               // kIOHIDEventFieldDigitizerX
-    private let kFieldY: Int = 0x100001               // kIOHIDEventFieldDigitizerY
+    private let kFieldX: Int32 = 0x100000             // kIOHIDEventFieldDigitizerX
+    private let kFieldY: Int32 = 0x100001             // kIOHIDEventFieldDigitizerY
     private let kSubBegin: UInt32 = 1                 // touch down
     private let kSubMove: UInt32 = 3                 // move
     private let kSubEnd: UInt32 = 2                 // touch up
@@ -131,7 +131,7 @@ final class TouchService: NSObject {
 
     private func handleEvent(_ event: IOHIDEventRef) {
         let type = IOHIDEventGetEventType(event)
-        guard type.rawValue == kDigitizerType else { return }
+        guard type == kDigitizerType else { return }
 
         let x = CGFloat(IOHIDEventGetFloatValue(event, kFieldX))
         let y = CGFloat(IOHIDEventGetFloatValue(event, kFieldY))

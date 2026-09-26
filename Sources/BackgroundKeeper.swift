@@ -82,7 +82,7 @@ final class BackgroundKeeper: NSObject, CLLocationManagerDelegate {
         do {
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
-            try session setActive(true)
+            try session.setActive(true)
         } catch {
             print("[BackgroundKeeper] Audio session error: \(error)")
             return
