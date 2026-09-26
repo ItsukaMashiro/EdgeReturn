@@ -15,7 +15,6 @@
 
 import Foundation
 import CoreGraphics
-import IOKit
 import UIKit
 
 final class TouchService: NSObject {
