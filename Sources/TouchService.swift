@@ -99,7 +99,7 @@ final class TouchService: NSObject {
         let setResult = IOHIDEventSystemClientSetEventDispatchFunction(
             clientRef,
             { ctx, event in
-                guard let ctx = ctx else { return }
+                guard let ctx = ctx, let event = event else { return }
                 let service = Unmanaged<TouchService>.fromOpaque(ctx).takeUnretainedValue()
                 service.handleEvent(event)
             },
@@ -272,7 +272,7 @@ final class TouchService: NSObject {
             0             // options
         ) else { return }
         IOHIDEventSystemClientDispatchEvent(client, event)
-        CFRelease(event)
+        Unmanaged.fromOpaque(event).release()
     }
 
     // MARK: - Diagnostics

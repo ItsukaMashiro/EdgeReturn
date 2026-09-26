@@ -106,7 +106,7 @@ final class BackgroundKeeper: NSObject, CLLocationManagerDelegate {
         let sampleRate = 44100.0
         let seconds = 2.0
         let frameCount = AVAudioFrameCount(sampleRate * seconds)
-        let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2)
+        guard let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 2) else { return }
         guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return }
         buffer.frameLength = frameCount
         // Zero the samples (silent).
@@ -158,11 +158,19 @@ final class BackgroundKeeper: NSObject, CLLocationManagerDelegate {
 
 private extension UInt32 {
     var littleEndianData: Data {
-        withUnsafeBytes { Data($0.reversed()) }
+        Data([
+            UInt8(self & 0xFF),
+            UInt8((self >> 8) & 0xFF),
+            UInt8((self >> 16) & 0xFF),
+            UInt8((self >> 24) & 0xFF),
+        ])
     }
 }
 private extension UInt16 {
     var littleEndianData: Data {
-        withUnsafeBytes { Data($0.reversed()) }
+        Data([
+            UInt8(self & 0xFF),
+            UInt8((self >> 8) & 0xFF),
+        ])
     }
 }
