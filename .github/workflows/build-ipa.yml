@@ -107,9 +107,11 @@ jobs:
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
           # Import the P12 (certificate + private key)
+          # macOS 26: the -t cert flag fails with "Import/Export format
+          # unsupported"; omitting -t imports the P12 as an identity
+          # (cert + key), which is what code signing needs.
           security import ~/signing/cert.p12 \
             -P "$P12_PASSWORD" \
-            -t cert \
             -k "$KEYCHAIN_PATH"
           # Allow the key to be used for code signing
           security set-key-partition-list -S signing -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
