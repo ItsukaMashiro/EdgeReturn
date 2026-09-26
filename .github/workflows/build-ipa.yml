@@ -57,10 +57,19 @@ jobs:
           set -e
           KEYCHAIN_PATH=$RUNNER_TEMP/$KEYCHAIN_NAME.keychain-db
 
+          # macOS 26 renamed `set-keychain-attrs` to `set-keychain-settings`
+          set_keychain_attrs() {
+            if security set-keychain-attrs -h >/dev/null 2>&1; then
+              security set-keychain-attrs "$@"
+            else
+              security set-keychain-settings "$@"
+            fi
+          }
+
           # Fresh signing keychain
           if [ -f "$KEYCHAIN_PATH" ]; then rm -f "$KEYCHAIN_PATH"; fi
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-attrs "$KEYCHAIN_PATH" -u
+          set_keychain_attrs "$KEYCHAIN_PATH" -u
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
           # Import the P12 (certificate + private key)
@@ -74,7 +83,7 @@ jobs:
           # Make it the default and part of the search list
           security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"' | tr '\n' ' ')
           security default-keychain -s "$KEYCHAIN_PATH"
-          security set-keychain-attrs "$KEYCHAIN_PATH" -u
+          set_keychain_attrs "$KEYCHAIN_PATH" -u
 
           # Install the provisioning profile
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
@@ -95,7 +104,7 @@ jobs:
 
       - name: Build (archive)
         run: |
-          set -e
+          set -e -o pipefail
           xcodebuild archive \
             -project "$PROJECT" \
             -scheme "$SCHEME" \
@@ -131,7 +140,7 @@ jobs:
 
       - name: Export IPA
         run: |
-          set -e
+          set -e -o pipefail
           xcodebuild -exportArchive \
             -archivePath build/EdgeReturn.xcarchive \
             -optionsPlist ExportOptions.plist \
