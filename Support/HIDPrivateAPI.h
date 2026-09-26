@@ -9,6 +9,7 @@
 //
 
 #import <Foundation/Foundation.h>
+#include <stdint.h>
 
 // IOHIDEventRef and IOHIDEventSetRef are defined in the private
 // <IOKit/hid/IOHIDEvent.h>, which is not shipped in the SDK. We only use these
@@ -61,26 +62,26 @@ kern_return_t IOHIDEventSystemClientDispatchEventSet(IOHIDEventSystemClientRef c
 // Digitizer (touch) event creation (private)
 // ---------------------------------------------------------------------------
 IOHIDEventRef IOHIDEventCreateDigitizerEvent(CFAllocatorRef allocator,
-                                            UInt32 timestamp,
-                                            UInt32 type,
-                                            UInt32 subType,
-                                            UInt32 index,
-                                            UInt32 range,
-                                            UInt32 digitizerType,
-                                            Float32 x,
-                                            Float32 y,
-                                            Float32 z,
-                                            Float32 v,
-                                            UInt32 options);
+                                            uint32_t timestamp,
+                                            uint32_t type,
+                                            uint32_t subType,
+                                            uint32_t index,
+                                            uint32_t range,
+                                            uint32_t digitizerType,
+                                            float x,
+                                            float y,
+                                            float z,
+                                            float v,
+                                            uint32_t options);
 
 IOHIDEventSetRef IOHIDEventCreateDigitizerEventSet(CFAllocatorRef allocator,
-                                                  UInt32 maxEvents);
+                                                  uint32_t maxEvents);
 
 // ---------------------------------------------------------------------------
 // Event query (private) — normally provided by <IOKit/hid/IOHIDEvent.h>
 // ---------------------------------------------------------------------------
-UInt32 IOHIDEventGetEventType(IOHIDEventRef event);
-Float32 IOHIDEventGetFloatValue(IOHIDEventRef event, Int32 field);
+uint32_t IOHIDEventGetEventType(IOHIDEventRef event);
+float IOHIDEventGetFloatValue(IOHIDEventRef event, int32_t field);
 
 #ifdef __cplusplus
 }
