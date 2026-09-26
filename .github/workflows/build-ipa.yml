@@ -128,7 +128,9 @@ jobs:
           # Extract identifiers from the profile
           PROFILE_PLIST=$(mktemp)
           security cms -D -i ~/signing/profile.mobileprovision > "$PROFILE_PLIST"
-          PROFILE_UUID=$(plutil -extract ProvisioningProfileUUID raw -o - "$PROFILE_PLIST")
+          # This profile (newer Xcode format) stores the UUID under `UUID`,
+          # not `ProvisioningProfileUUID`.
+          PROFILE_UUID=$(plutil -extract UUID raw -o - "$PROFILE_PLIST")
           TEAM_ID=$(plutil -extract TeamIdentifier.0 raw -o - "$PROFILE_PLIST")
           NAME=$(plutil -extract Name raw -o - "$PROFILE_PLIST" || echo "EdgeReturn")
           echo "Profile: $NAME (UUID $PROFILE_UUID, team $TEAM_ID)"
