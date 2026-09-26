@@ -272,7 +272,7 @@ final class TouchService: NSObject {
             0             // options
         ) else { return }
         IOHIDEventSystemClientDispatchEvent(client, event)
-        Unmanaged.fromOpaque(event).release()
+        Unmanaged.fromOpaque<NSObject>(event).release()
     }
 
     // MARK: - Diagnostics
