@@ -19,6 +19,7 @@ struct ContentView: View {
     @AppStorage("longPressEnabled") private var longPressEnabled = false
     @AppStorage("hapticsEnabled") private var hapticsEnabled = true
     @AppStorage("preventSleep") private var preventSleep = false
+    @AppStorage("injectionSet") private var injectionSet: String = "A"
 
     @State private var backFlash = false
 
@@ -54,6 +55,7 @@ struct ContentView: View {
             BackgroundKeeper.shared.start()
         }
         .onChange(of: svc.lastBackAt) { _ in flashBack() }
+        .onChange(of: injectionSet) { _ in svc.injectionSet = injectionSet }
         .onChange(of: edgeThreshold) { _ in svc.edgeThreshold = Float(edgeThreshold) }
         .onChange(of: engageDistance) { _ in svc.engageDistance = Float(engageDistance) }
         .onChange(of: completeDistance) { _ in svc.completeDistance = Float(completeDistance) }
@@ -71,6 +73,7 @@ struct ContentView: View {
         svc.backEnabled = backEnabled
         svc.longPressEnabled = longPressEnabled
         svc.hapticsEnabled = hapticsEnabled
+        svc.injectionSet = injectionSet
         keeper.preventSleep = preventSleep
     }
 
@@ -227,34 +230,52 @@ struct ContentView: View {
     }
 
     private var testSection: some View {
-        HStack(spacing: 10) {
-            Button { svc.testBack() } label: {
-                HStack {
-                    Image(systemName: "chevron.left")
-                    Text("Test back")
+        VStack(spacing: 10) {
+            HStack(spacing: 10) {
+                Button { svc.testBack(set: injectionSet) } label: {
+                    HStack {
+                        Image(systemName: "chevron.left")
+                        Text("Test back")
+                    }
+                    .font(.body.weight(.semibold))
+                    .foregroundColor(.black)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(RoundedRectangle(cornerRadius: 12).fill(Color.orange))
                 }
-                .font(.body.weight(.semibold))
-                .foregroundColor(.black)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 12)
-                .background(RoundedRectangle(cornerRadius: 12).fill(Color.orange))
-            }
-            .disabled(!svc.isObserving)
-            .opacity(svc.isObserving ? 1 : 0.5)
+                .disabled(!svc.isObserving)
+                .opacity(svc.isObserving ? 1 : 0.5)
 
-            Button { svc.testHome() } label: {
-                HStack {
-                    Image(systemName: "house")
-                    Text("Test home")
+                Button { svc.testHome(set: injectionSet) } label: {
+                    HStack {
+                        Image(systemName: "house")
+                        Text("Test home")
+                    }
+                    .font(.body.weight(.semibold))
+                    .foregroundColor(.black)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .background(RoundedRectangle(cornerRadius: 12).fill(Color.green))
                 }
-                .font(.body.weight(.semibold))
-                .foregroundColor(.black)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 12)
-                .background(RoundedRectangle(cornerRadius: 12).fill(Color.green))
+                .disabled(!svc.isObserving)
+                .opacity(svc.isObserving ? 1 : 0.5)
             }
-            .disabled(!svc.isObserving)
-            .opacity(svc.isObserving ? 1 : 0.5)
+            // Calibration: which private-API constant set to inject with.
+            HStack(spacing: 8) {
+                Text("Injection set")
+                    .font(.subheadline)
+                    .foregroundColor(.white.opacity(0.8))
+                Picker("", selection: $injectionSet) {
+                    Text("A (modern)").tag("A")
+                    Text("B (2010 hdr)").tag("B")
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 180)
+                Spacer()
+            }
+            Text("Calibration: the event log shows raw events (both field encodings). Pick the set whose test button actually makes the system go back / home.")
+                .font(.caption2)
+                .foregroundColor(.white.opacity(0.4))
         }
     }
 

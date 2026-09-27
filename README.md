@@ -21,6 +21,25 @@ not just this one.
 > The private HID APIs are the "magic" part. If a future iOS release changes
 > them, only `TouchService.swift` + `HIDPrivateAPI.h` need updating.
 
+## Calibration (v2)
+
+The exact numeric values of the private API (event type, field ids,
+digitizer subtype, transducer type) are not published by Apple, so the app
+calibrates itself on-device:
+
+- **Raw-event diagnostics** — the first ~40 events the observer receives are
+  logged verbatim in the UI event log, read with *both* candidate field
+  encodings (A: `0x100000`-block, B: `0xB00000`-block), so the real
+  on-device encoding is visible at a glance.
+- **Behavioral touch tracking** — touches are tracked by their digitizer
+  *index* appearing / moving / going silent (250 ms timeout), so observation
+  works regardless of which subtype encoding the device uses.
+- **Dual constant sets for injection** — the synthetic swipe can be injected
+  with set **A** (modern values: type 30, subtypes 1/3/2, finger 13) or set
+  **B** (2010-header values: type 11, subtypes 0/2/1, finger 34). The UI has
+  a set picker plus per-set test buttons: whichever set actually makes the
+  system go back / home is the one to keep.
+
 ## Project layout
 
 ```
