@@ -67,46 +67,6 @@ jobs:
           ls -la ~/signing
           file ~/signing/cert.p12 ~/signing/profile.mobileprovision
 
-      - name: Debug P12 on runner
-        env:
-          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
-        run: |
-          echo "=== P12 size ==="
-          stat -f%z ~/signing/cert.p12
-          echo "=== first 16 bytes (hex) ==="
-          xxd ~/signing/cert.p12 | head -2
-          echo "=== file type ==="
-          file ~/signing/cert.p12
-          echo "=== openssl pkcs12 -info ==="
-          openssl pkcs12 -in ~/signing/cert.p12 -info -nomacver -passin "pass:$P12_PASSWORD" 2>&1 | head -20
-          echo "=== macOS + security version ==="
-          sw_vers
-          security 2>&1 | head -3
-          echo "=== extract PEM cert + key ==="
-          openssl pkcs12 -in ~/signing/cert.p12 -nokeys -passin "pass:$P12_PASSWORD" -out ~/signing/cert.pem 2>&1
-          openssl pkcs12 -in ~/signing/cert.p12 -nocerts -passin "pass:$P12_PASSWORD" -nodes -out ~/signing/key.pem 2>&1
-          ls -la ~/signing/*.pem
-          echo "=== test A: import PEM cert only ==="
-          DK=$RUNNER_TEMP/debug.keychain-db
-          security create-keychain -p debugpw "$DK"
-          security import ~/signing/cert.pem -t cert -k "$DK" 2>&1 && echo "PEM_CERT_OK" || echo "PEM_CERT_FAILED"
-          echo "=== test B: import P12 WITHOUT -t flag ==="
-          DK2=$RUNNER_TEMP/debug2.keychain-db
-          security create-keychain -p debugpw "$DK2"
-          security import ~/signing/cert.p12 -P "$P12_PASSWORD" -k "$DK2" 2>&1 && echo "P12_NO_T_OK" || echo "P12_NO_T_FAILED"
-          echo "=== test D: import P12 with -f pkcs12 ==="
-          security import ~/signing/cert.p12 -f pkcs12 -P "$P12_PASSWORD" -k "$DK2" 2>&1 && echo "P12_F_PKCS12_OK" || echo "P12_F_PKCS12_FAILED"
-          echo "=== test E: import PEM cert with -f openssl ==="
-          security import ~/signing/cert.pem -f openssl -t cert -k "$DK" 2>&1 && echo "PEM_F_OPENSSL_OK" || echo "PEM_F_OPENSSL_FAILED"
-          echo "=== test F: import PEM cert with -f pemseq ==="
-          security import ~/signing/cert.pem -f pemseq -k "$DK" 2>&1 && echo "PEM_F_PEMSEQ_OK" || echo "PEM_F_PEMSEQ_FAILED"
-          echo "=== test G: import PEM key with -f openssl -t priv ==="
-          security import ~/signing/key.pem -f openssl -t priv -k "$DK" 2>&1 && echo "KEY_F_OPENSSL_OK" || echo "KEY_F_OPENSSL_FAILED"
-          echo "=== list keychain A contents ==="
-          security find-identity -v -p codesigning "$DK" 2>&1 | head -10
-          echo "=== list keychain B contents ==="
-          security find-identity -v -p codesigning "$DK2" 2>&1 | head -10
-
       - name: Import certificate & profile
         env:
           P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
