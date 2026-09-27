@@ -154,7 +154,7 @@ final class BackgroundKeeper: NSObject, CLLocationManagerDelegate, ObservableObj
         do {
             let session = AVAudioSession.sharedInstance()
             try session.setCategory(.playback, mode: .default, options: [.mixWithOthers, .duckOthers])
-            try session setActive(true)
+            try session.setActive(true)
         } catch {
             print("[BackgroundKeeper] Audio session error: \(error)")
             audioActive = false
@@ -249,11 +249,19 @@ final class BackgroundKeeper: NSObject, CLLocationManagerDelegate, ObservableObj
 
 private extension UInt32 {
     var littleEndianData: Data {
-        withUnsafeBytes { Data($0.reversed()) }
+        Data([
+            UInt8(self & 0xFF),
+            UInt8((self >> 8) & 0xFF),
+            UInt8((self >> 16) & 0xFF),
+            UInt8((self >> 24) & 0xFF),
+        ])
     }
 }
 private extension UInt16 {
     var littleEndianData: Data {
-        withUnsafeBytes { Data($0.reversed()) }
+        Data([
+            UInt8(self & 0xFF),
+            UInt8((self >> 8) & 0xFF),
+        ])
     }
 }

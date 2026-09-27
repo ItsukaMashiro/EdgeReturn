@@ -64,6 +64,38 @@ jobs:
           ls -la ~/signing
           file ~/signing/cert.p12 ~/signing/profile.mobileprovision
 
+      - name: Debug P12 on runner
+        env:
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+        run: |
+          echo "=== P12 size ==="
+          stat -f%z ~/signing/cert.p12
+          echo "=== first 16 bytes (hex) ==="
+          xxd ~/signing/cert.p12 | head -2
+          echo "=== file type ==="
+          file ~/signing/cert.p12
+          echo "=== openssl pkcs12 -info ==="
+          openssl pkcs12 -in ~/signing/cert.p12 -info -nomacver -passin "pass:$P12_PASSWORD" 2>&1 | head -20
+          echo "=== macOS + security version ==="
+          sw_vers
+          security 2>&1 | head -3
+          echo "=== extract PEM cert + key ==="
+          openssl pkcs12 -in ~/signing/cert.p12 -nokeys -passin "pass:$P12_PASSWORD" -out ~/signing/cert.pem 2>&1
+          openssl pkcs12 -in ~/signing/cert.p12 -nocerts -passin "pass:$P12_PASSWORD" -nodes -out ~/signing/key.pem 2>&1
+          ls -la ~/signing/*.pem
+          echo "=== test A: import PEM cert only ==="
+          DK=$RUNNER_TEMP/debug.keychain-db
+          security create-keychain -p debugpw "$DK"
+          security import ~/signing/cert.pem -t cert -k "$DK" 2>&1 && echo "PEM_CERT_OK" || echo "PEM_CERT_FAILED"
+          echo "=== test B: import P12 WITHOUT -t flag ==="
+          DK2=$RUNNER_TEMP/debug2.keychain-db
+          security create-keychain -p debugpw "$DK2"
+          security import ~/signing/cert.p12 -P "$P12_PASSWORD" -k "$DK2" 2>&1 && echo "P12_NO_T_OK" || echo "P12_NO_T_FAILED"
+          echo "=== test C: import P12 with -t identity ==="
+          security import ~/signing/cert.p12 -P "$P12_PASSWORD" -t identity -k "$DK2" 2>&1 && echo "P12_ID_OK" || echo "P12_ID_FAILED"
+          echo "=== list keychain A contents ==="
+          security find-identity -v -p codesigning "$DK" 2>&1 | head -10
+
       - name: Import certificate & profile
         env:
           P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
@@ -71,14 +103,27 @@ jobs:
           set -e
           KEYCHAIN_PATH=$RUNNER_TEMP/$KEYCHAIN_NAME.keychain-db
 
+          # macOS 26 renamed `set-keychain-attrs` to `set-keychain-settings`
+          # and its parser requires flags before the keychain path
+          set_keychain_attrs() {
+            if security set-keychain-attrs -h >/dev/null 2>&1; then
+              security set-keychain-attrs "$@"
+            else
+              local path="$1"; shift
+              security set-keychain-settings "$@" "$path"
+            fi
+          }
+
           # Fresh signing keychain
           if [ -f "$KEYCHAIN_PATH" ]; then rm -f "$KEYCHAIN_PATH"; fi
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-attrs "$KEYCHAIN_PATH" -u
+          set_keychain_attrs "$KEYCHAIN_PATH" -u
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-          # Import the P12 (certificate + private key) as an identity.
-          # NOTE: do NOT pass -t cert — that would drop the private key.
+          # Import the P12 (certificate + private key)
+          # macOS 26: the -t cert flag fails with "Import/Export format
+          # unsupported"; omitting -t imports the P12 as an identity
+          # (cert + key), which is what code signing needs.
           security import ~/signing/cert.p12 \
             -P "$P12_PASSWORD" \
             -k "$KEYCHAIN_PATH"
@@ -88,6 +133,7 @@ jobs:
           # Make it the default and part of the search list.
           security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"' | tr '\n' ' ')
           security default-keychain -s "$KEYCHAIN_PATH"
+          set_keychain_attrs "$KEYCHAIN_PATH" -u
 
           # Install the provisioning profile.
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
@@ -96,7 +142,9 @@ jobs:
           # Extract identifiers from the profile.
           PROFILE_PLIST=$(mktemp)
           security cms -D -i ~/signing/profile.mobileprovision > "$PROFILE_PLIST"
-          PROFILE_UUID=$(plutil -extract ProvisioningProfileUUID raw -o - "$PROFILE_PLIST")
+          # Newer Xcode profile format stores the UUID under `UUID`;
+          # older profiles use `ProvisioningProfileUUID`.
+          PROFILE_UUID=$(plutil -extract UUID raw -o - "$PROFILE_PLIST" 2>/dev/null || plutil -extract ProvisioningProfileUUID raw -o - "$PROFILE_PLIST")
           TEAM_ID=$(plutil -extract TeamIdentifier.0 raw -o - "$PROFILE_PLIST")
           NAME=$(plutil -extract Name raw -o - "$PROFILE_PLIST" || echo "EdgeReturn")
           echo "Profile: $NAME (UUID $PROFILE_UUID, team $TEAM_ID)"
@@ -106,7 +154,7 @@ jobs:
             echo "TEAM_ID=$TEAM_ID"
           } >> "$GITHUB_ENV"
 
-      - name: Preflight: verify signing chain
+      - name: "Preflight: verify signing chain"
         run: |
           set -e
           # 1. The imported identity must be a valid codesigning identity.
@@ -147,17 +195,19 @@ jobs:
 
       - name: Build (archive)
         run: |
-          set -e
-          set -o pipefail
+          set -e -o pipefail
+          # The profile is Xcode-managed, so it requires Automatic signing
+          # (Manual style rejects Xcode-managed profiles). Force the exact
+          # profile by name via PROVISIONING_PROFILE_SPECIFIER.
           xcodebuild archive \
             -project "$PROJECT" \
             -scheme "$SCHEME" \
             -configuration Release \
             -destination "generic/platform=iOS" \
             -archivePath build/EdgeReturn.xcarchive \
-            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_STYLE=Automatic \
             DEVELOPMENT_TEAM="$TEAM_ID" \
-            PROVISIONING_PROFILE="$PROFILE_UUID" \
+            PROVISIONING_PROFILE_SPECIFIER="$NAME" \
             | tail -n 60
 
       - name: Write export options
@@ -184,8 +234,7 @@ jobs:
 
       - name: Export IPA
         run: |
-          set -e
-          set -o pipefail
+          set -e -o pipefail
           xcodebuild -exportArchive \
             -archivePath build/EdgeReturn.xcarchive \
             -optionsPlist ExportOptions.plist \

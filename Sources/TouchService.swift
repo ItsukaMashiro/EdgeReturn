@@ -34,6 +34,7 @@
 //
 
 import Foundation
+import CoreGraphics
 import UIKit
 import QuartzCore
 import CoreHaptics
@@ -87,11 +88,17 @@ final class TouchService: NSObject, ObservableObject {
     private typealias SetDispatchFn = @convention(c) (IOHIDEventSystemClientRef?, @convention(c) (UnsafeMutableRawPointer?, IOHIDEventRef?) -> Void, UnsafeMutableRawPointer?) -> Int32
     private typealias DispatchEventFn = @convention(c) (IOHIDEventSystemClientRef?, IOHIDEventRef?) -> Int32
     private typealias DigitizerFn = @convention(c) (CFAllocator?, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, Float32, Float32, Float32, Float32, UInt32) -> IOHIDEventRef?
+    private typealias GetEventTypeFn = @convention(c) (IOHIDEventRef?) -> UInt32
+    private typealias GetFloatFn = @convention(c) (IOHIDEventRef?, Int32) -> Float32
+    private typealias GetIntFn = @convention(c) (IOHIDEventRef?, Int32) -> Int32
 
     private var fnCreate: CreateFn?
     private var fnSetDispatch: SetDispatchFn?
     private var fnDispatchEvent: DispatchEventFn?
     private var fnDigitizer: DigitizerFn?
+    private var fnGetEventType: GetEventTypeFn?
+    private var fnGetFloat: GetFloatFn?
+    private var fnGetInt: GetIntFn?
 
     private var lastTriggerAt: Date = .distantPast
     private var hapticEngine: CHHapticEngine?
@@ -115,7 +122,8 @@ final class TouchService: NSObject, ObservableObject {
     private let kSubBegin: UInt32 = 1
     private let kSubMove: UInt32 = 3
     private let kSubEnd: UInt32 = 2
-    private let kDigitizerType: UInt32 = 13 // kIOHIDEventDigitizerTypeFinger
+    private let kDigitizerFingerType: UInt32 = 13 // kIOHIDEventDigitizerTypeFinger
+    private let kEventDigitizerType: UInt32 = 30  // IOHIDEventTypeDigitizer
 
     static let shared = TouchService()
 
@@ -133,7 +141,7 @@ final class TouchService: NSObject, ObservableObject {
             let kr = create(nil, &c)
             if kr == 0, let client = c {
                 let kr2 = setDispatch(client, { ctx, event in
-                    guard let ctx = ctx else { return }
+                    guard let ctx = ctx, let event = event else { return }
                     let service = Unmanaged<TouchService>.fromOpaque(ctx).takeUnretainedValue()
                     service.handleEvent(event)
                 }, Unmanaged.passUnretained(self).toOpaque())
@@ -150,7 +158,7 @@ final class TouchService: NSObject, ObservableObject {
                 hidDetail = "client create failed (kr=\(kr))"
             }
         } else {
-            hidDetail = hidAvailable ? "symbols missing" : "symbols missing"
+            hidDetail = "symbols missing"
         }
         // Fallback: foreground-only edge pan on our own window.
         setupFallbackRecognizer()
@@ -168,7 +176,11 @@ final class TouchService: NSObject, ObservableObject {
         fnSetDispatch = symbol("IOHIDEventSystemClientSetEventDispatchFunction")
         fnDispatchEvent = symbol("IOHIDEventSystemClientDispatchEvent")
         fnDigitizer = symbol("IOHIDEventCreateDigitizerEvent")
-        hidAvailable = fnCreate != nil && fnSetDispatch != nil && fnDispatchEvent != nil && fnDigitizer != nil
+        fnGetEventType = symbol("IOHIDEventGetEventType")
+        fnGetFloat = symbol("IOHIDEventGetFloatValue")
+        fnGetInt = symbol("IOHIDEventGetIntegerValue")
+        hidAvailable = fnCreate != nil && fnSetDispatch != nil && fnDispatchEvent != nil
+            && fnDigitizer != nil && fnGetEventType != nil && fnGetFloat != nil && fnGetInt != nil
         hidDetail = hidAvailable ? "symbols resolved" : "symbols missing"
     }
 
@@ -337,7 +349,7 @@ final class TouchService: NSObject, ObservableObject {
             let f = CFTimeInterval(i) / n
             let eased = 1 - pow(1 - f, 2)
             let t = duration * eased
-            let ev = digitizer(nil, UInt32((begin + t) * 1_000_000), 13, sub, 0, 0, kDigitizerType, p.0, p.1, 0, 1, 0)
+            let ev = digitizer(nil, UInt32((begin + t) * 1_000_000), kEventDigitizerType, sub, 0, 0, kDigitizerFingerType, p.0, p.1, 0, 1, 0)
             if let ev = ev { dispatch(client, ev) }
         }
         print("EdgeReturn: injected \(edge == .left ? "back" : "home") swipe")
@@ -348,13 +360,16 @@ final class TouchService: NSObject, ObservableObject {
     // MARK: - HID event handling
 
     private func handleEvent(_ event: IOHIDEventRef?) {
-        guard let event = event else { return }
-        let type = IOHIDEventGetEventType(event)
-        guard type == IOHIDEventTypeDigitizer else { return }
-        let subType = IOHIDEventGetIntegerValue(event, kIOHIDEventFieldDigitizerSubType)
-        let x = Float(IOHIDEventGetFloatValue(event, kIOHIDEventFieldDigitizerX))
-        let y = Float(IOHIDEventGetFloatValue(event, kIOHIDEventFieldDigitizerY))
-        let index = Int(IOHIDEventGetIntegerValue(event, kIOHIDEventFieldDigitizerIndex))
+        guard let event = event,
+              let getEventType = fnGetEventType,
+              let getFloat = fnGetFloat,
+              let getInt = fnGetInt else { return }
+        let type = getEventType(event)
+        guard type == kEventDigitizerType else { return }
+        let subType = getInt(event, 0x100009) // kIOHIDEventFieldDigitizerSubType
+        let x = getFloat(event, 0x100000)     // kIOHIDEventFieldDigitizerX
+        let y = getFloat(event, 0x100001)     // kIOHIDEventFieldDigitizerY
+        let index = Int(getInt(event, 0x100004)) // kIOHIDEventFieldDigitizerIndex
 
         switch subType {
         case Int32(kSubBegin):

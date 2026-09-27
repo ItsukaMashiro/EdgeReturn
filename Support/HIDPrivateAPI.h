@@ -4,17 +4,19 @@
 //  system-wide on non-jailbroken iOS.
 //
 //  These symbols live in the system IOKit framework but are not exposed in the
-//  public headers. We resolve them at RUNTIME with dlopen/dlsym instead of
-//  linking them directly: if a future iOS release removes a symbol, the build
-//  still succeeds and the app degrades gracefully (the UI reports "HID
-//  unavailable") instead of failing to link or crashing at launch.
-//
-//  The public IOHIDEvent* helpers (getters, field constants) are still imported
-//  normally from <IOKit/hid/IOHIDEvent.h> and linked directly — those are safe.
+//  public headers. Declaring them here lets Swift call them through the
+//  bridging header.
 //
 
 #import <Foundation/Foundation.h>
-#import <IOKit/hid/IOHIDEvent.h>
+#include <stdint.h>
+
+// IOHIDEventRef and IOHIDEventSetRef are defined in the private
+// <IOKit/hid/IOHIDEvent.h>, which is not shipped in the SDK. We only use these
+// types as opaque pointers (never accessing members), so forward-declare them
+// instead of importing the private header.
+typedef struct __IOHIDEvent *IOHIDEventRef;
+typedef struct __IOHIDEventSet *IOHIDEventSetRef;
 
 #ifdef __cplusplus
 extern "C" {
@@ -31,34 +33,69 @@ typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
 // Event dispatch callback (private)
 // ---------------------------------------------------------------------------
 typedef void (*IOHIDEventSystemClientEventDispatchFunction)(void *context,
-                                                           IOHIDEventRef event);
+                                                          IOHIDEventRef event);
 
 // ---------------------------------------------------------------------------
-// Function-pointer typedefs for the private symbols (resolved via dlsym)
+// Client lifecycle (private)
 // ---------------------------------------------------------------------------
-typedef kern_return_t (*PFN_IOHIDEventSystemClientCreate)(CFAllocatorRef allocator,
-                                                         IOHIDEventSystemClientRef *client);
-typedef void (*PFN_IOHIDEventSystemClientDestroy)(IOHIDEventSystemClientRef client);
-typedef kern_return_t (*PFN_IOHIDEventSystemClientSetEventDispatchFunction)(
+kern_return_t IOHIDEventSystemClientCreate(CFAllocatorRef allocator,
+                                          IOHIDEventSystemClientRef *client);
+void IOHIDEventSystemClientDestroy(IOHIDEventSystemClientRef client);
+
+// ---------------------------------------------------------------------------
+// Observation (private)
+// ---------------------------------------------------------------------------
+kern_return_t IOHIDEventSystemClientSetEventDispatchFunction(
     IOHIDEventSystemClientRef client,
     IOHIDEventSystemClientEventDispatchFunction function,
     void *context);
-typedef kern_return_t (*PFN_IOHIDEventSystemClientDispatchEvent)(IOHIDEventSystemClientRef client,
-                                                               IOHIDEventRef event);
-typedef kern_return_t (*PFN_IOHIDEventSystemClientDispatchEventSet)(IOHIDEventSystemClientRef client,
-                                                                  IOHIDEventSetRef eventSet);
-typedef IOHIDEventRef (*PFN_IOHIDEventCreateDigitizerEvent)(CFAllocatorRef allocator,
-                                                           UInt32 timestamp,
-                                                           UInt32 type,
-                                                           UInt32 subType,
-                                                           UInt32 index,
-                                                           UInt32 range,
-                                                           UInt32 digitizerType,
-                                                           Float32 x,
-                                                           Float32 y,
-                                                           Float32 z,
-                                                           Float32 v,
-                                                           UInt32 options);
+
+// ---------------------------------------------------------------------------
+// Injection (private)
+// ---------------------------------------------------------------------------
+kern_return_t IOHIDEventSystemClientDispatchEvent(IOHIDEventSystemClientRef client,
+                                                 IOHIDEventRef event);
+kern_return_t IOHIDEventSystemClientDispatchEventSet(IOHIDEventSystemClientRef client,
+                                                    IOHIDEventSetRef eventSet);
+
+// ---------------------------------------------------------------------------
+// Digitizer (touch) event creation (private)
+// ---------------------------------------------------------------------------
+IOHIDEventRef IOHIDEventCreateDigitizerEvent(CFAllocatorRef allocator,
+                                            uint32_t timestamp,
+                                            uint32_t type,
+                                            uint32_t subType,
+                                            uint32_t index,
+                                            uint32_t range,
+                                            uint32_t digitizerType,
+                                            float x,
+                                            float y,
+                                            float z,
+                                            float v,
+                                            uint32_t options);
+
+IOHIDEventSetRef IOHIDEventCreateDigitizerEventSet(CFAllocatorRef allocator,
+                                                  uint32_t maxEvents);
+
+// ---------------------------------------------------------------------------
+// Event query (private) — normally provided by <IOKit/hid/IOHIDEvent.h>
+// ---------------------------------------------------------------------------
+uint32_t IOHIDEventGetEventType(IOHIDEventRef event);
+float IOHIDEventGetFloatValue(IOHIDEventRef event, int32_t field);
+int32_t IOHIDEventGetIntegerValue(IOHIDEventRef event, int32_t field);
+
+// ---------------------------------------------------------------------------
+// Event / digitizer constants (private header values)
+// ---------------------------------------------------------------------------
+// IOHIDEventTypeDigitizer: the event type of a digitizer (touch) event.
+static const uint32_t kER_IOHIDEventTypeDigitizer = 30;
+// Digitizer field ids (0x100000 block, private header values).
+static const int32_t kER_IOHIDEventFieldDigitizerX = 0x100000;
+static const int32_t kER_IOHIDEventFieldDigitizerY = 0x100001;
+static const int32_t kER_IOHIDEventFieldDigitizerIndex = 0x100004;
+static const int32_t kER_IOHIDEventFieldDigitizerSubType = 0x100009;
+// Digitizer (finger) type: kIOHIDEventDigitizerTypeFinger.
+static const uint32_t kER_IOHIDEventDigitizerTypeFinger = 13;
 
 #ifdef __cplusplus
 }
