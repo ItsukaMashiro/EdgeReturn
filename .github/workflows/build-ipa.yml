@@ -123,31 +123,6 @@ jobs:
           security default-keychain -s "$KEYCHAIN_PATH"
           set_keychain_attrs "$KEYCHAIN_PATH" -u
 
-          # Xcode classifies a profile as "Xcode managed" (and rejects it
-          # under Manual signing) when its Name matches Xcode's own
-          # auto-generated pattern ("iOS Team Provisioning Profile: ...").
-          # Rename the embedded plist Name locally and re-wrap it in a
-          # minimal CMS SignedData (self-signed cert). xcodebuild only
-          # extracts the plist; device-side acceptance is verified by the
-          # install test. The UUID is unchanged, so PROVISIONING_PROFILE
-          # still matches.
-          python3 -m pip install --quiet cryptography 2>/dev/null || true
-          python3 tools/rename_profile.py \
-            ~/signing/profile.mobileprovision \
-            ~/signing/profile-renamed.mobileprovision \
-            "EdgeReturn-Dev"
-
-          # Install the renamed profile in the MANUAL location.
-          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
-          cp ~/signing/profile-renamed.mobileprovision "$HOME/Library/MobileDevice/Provisioning Profiles/"
-          # Xcode 15+ also keeps an "Xcode managed" store; a copy of the
-          # same UUID there makes xcodebuild classify the profile as
-          # "Xcode managed". Clear it (fresh runner — nothing else lives there).
-          if [ -d "$HOME/Library/Developer/Xcode/UserData/ProvisioningProfiles" ]; then
-            rm -f "$HOME/Library/Developer/Xcode/UserData/ProvisioningProfiles/"* 2>/dev/null || true
-          fi
-          ls -la "$HOME/Library/MobileDevice/Provisioning Profiles/"
-
           # Extract identifiers from the profile.
           PROFILE_PLIST=$(mktemp)
           security cms -D -i ~/signing/profile.mobileprovision > "$PROFILE_PLIST"
@@ -205,12 +180,26 @@ jobs:
           print(f"Profile valid until: {exp.isoformat() if exp else 'n/a'}")
           EOF
 
-      - name: Build (archive)
+      - name: Preflight: Apple reachability
         run: |
-          set -e -o pipefail
-          # Manual signing with the explicit profile UUID: never talks to
-          # Apple's servers, so it cannot hang the way Automatic signing
-          # did on this runner (6h stall).
+          # Automatic signing needs to reach Apple's developer services.
+          # Probe with a short timeout so a blocked runner fails fast.
+          if curl -sS -m 15 -o /dev/null -w "developerservices2.apple.com -> %{http_code}\n" \
+               "https://developerservices2.apple.com/services/QH65B2/ios/listTeams.action?clientId=XABBG36SBA" ; then
+            echo "Apple reachable"
+          else
+            echo "::warning::Apple developer services not reachable (Automatic signing may hang)"
+          fi
+
+      - name: Build (archive, automatic signing)
+        run: |
+          set -e
+          # Automatic signing: xcodebuild downloads and manages the
+          # provisioning profile itself, so the profile's Name pattern
+          # ("iOS Team Provisioning Profile: ...") does NOT trigger the
+          # "Xcode managed but Manual signing" rejection. The certificate
+          # is in the keychain (import step). A hard watchdog kills the
+          # build after 600s in case Apple reachability hangs.
           IDENTITY=$(security find-identity -v -p codesigning | grep -Eo '"[^"]+"' | head -n 1 | tr -d '"')
           echo "Signing identity: $IDENTITY"
           mkdir -p build
@@ -220,11 +209,27 @@ jobs:
             -configuration Release \
             -destination "generic/platform=iOS" \
             -archivePath build/EdgeReturn.xcarchive \
-            CODE_SIGN_STYLE=Manual \
-            CODE_SIGN_IDENTITY="$IDENTITY" \
+            CODE_SIGN_STYLE=Automatic \
             DEVELOPMENT_TEAM="$TEAM_ID" \
-            PROVISIONING_PROFILE="$PROFILE_UUID" \
-            | tee build/archive.log | tail -n 60
+            > build/archive.log 2>&1 &
+          XCODE_PID=$!
+          echo "xcodebuild PID: $XCODE_PID"
+          for i in $(seq 1 600); do
+            if ! kill -0 "$XCODE_PID" 2>/dev/null; then break; fi
+            sleep 1
+          done
+          if kill -0 "$XCODE_PID" 2>/dev/null; then
+            echo "::error::xcodebuild timed out after 600s (Automatic signing likely hung on Apple reachability)"
+            kill "$XCODE_PID" 2>/dev/null || true
+            tail -n 40 build/archive.log
+            exit 1
+          fi
+          set +e
+          wait "$XCODE_PID"
+          STATUS=$?
+          set -e
+          tail -n 60 build/archive.log
+          exit $STATUS
 
       - name: Write export options
         run: |
