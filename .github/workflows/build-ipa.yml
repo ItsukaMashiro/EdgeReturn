@@ -123,13 +123,22 @@ jobs:
           security default-keychain -s "$KEYCHAIN_PATH"
           set_keychain_attrs "$KEYCHAIN_PATH" -u
 
-          # Install the provisioning profile in the MANUAL location.
+          # Xcode classifies a profile as "Xcode managed" (and rejects it
+          # under Manual signing) when its Name matches Xcode's own
+          # auto-generated pattern ("iOS Team Provisioning Profile: ...").
+          # Rename the embedded plist Name locally and re-encode: the UUID
+          # is unchanged, so PROVISIONING_PROFILE still matches.
+          security cms -D -i ~/signing/profile.mobileprovision > ~/signing/profile.plist
+          sed -i '' 's|iOS Team Provisioning Profile: com.itsukamashiro.edgereturn|EdgeReturn-Dev|' ~/signing/profile.plist
+          grep -A1 "<key>Name</key>" ~/signing/profile.plist || true
+          security cms -e -i ~/signing/profile.plist -o ~/signing/profile-renamed.mobileprovision
+
+          # Install the renamed profile in the MANUAL location.
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
-          cp ~/signing/profile.mobileprovision "$HOME/Library/MobileDevice/Provisioning Profiles/"
+          cp ~/signing/profile-renamed.mobileprovision "$HOME/Library/MobileDevice/Provisioning Profiles/"
           # Xcode 15+ also keeps an "Xcode managed" store; a copy of the
           # same UUID there makes xcodebuild classify the profile as
-          # "Xcode managed" and reject Manual signing. Clear it (fresh
-          # runner — nothing else lives there).
+          # "Xcode managed". Clear it (fresh runner — nothing else lives there).
           if [ -d "$HOME/Library/Developer/Xcode/UserData/ProvisioningProfiles" ]; then
             rm -f "$HOME/Library/Developer/Xcode/UserData/ProvisioningProfiles/"* 2>/dev/null || true
           fi
