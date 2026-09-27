@@ -78,7 +78,7 @@ jobs:
           rm -rf "$APP/_CodeSignature"
           rm -rf Payload && mkdir -p Payload
           cp -R "$APP" Payload/
-          ( cd Payload && zip -r -X ../EdgeReturn-unsigned.ipa . )
+          ( cd Payload && zip -r -X ../build/EdgeReturn-unsigned.ipa . )
           ls -la build/EdgeReturn-unsigned.ipa
 
       - name: Show app Info.plist
