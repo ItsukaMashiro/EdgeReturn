@@ -126,12 +126,20 @@ jobs:
           # Xcode classifies a profile as "Xcode managed" (and rejects it
           # under Manual signing) when its Name matches Xcode's own
           # auto-generated pattern ("iOS Team Provisioning Profile: ...").
-          # Rename the embedded plist Name locally and re-encode: the UUID
-          # is unchanged, so PROVISIONING_PROFILE still matches.
+          # Rename the embedded plist Name locally and re-encode with a
+          # self-signed cert (xcodebuild only extracts the plist; the
+          # device-side acceptance is verified by the install test).
+          # The UUID is unchanged, so PROVISIONING_PROFILE still matches.
           security cms -D -i ~/signing/profile.mobileprovision > ~/signing/profile.plist
           sed -i '' 's|iOS Team Provisioning Profile: com.itsukamashiro.edgereturn|EdgeReturn-Dev|' ~/signing/profile.plist
           grep -A1 "<key>Name</key>" ~/signing/profile.plist || true
-          security cms -S -i ~/signing/profile.plist -o ~/signing/profile-renamed.mobileprovision
+          openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+            -keyout ~/signing/cms.key -out ~/signing/cms.crt \
+            -subj "/CN=EdgeReturn-CI" 2>/dev/null
+          openssl pkcs7 -signed -in ~/signing/profile.plist \
+            -out ~/signing/profile-renamed.mobileprovision \
+            -certfile ~/signing/cms.crt -inkey ~/signing/cms.key -noencrypt
+          security cms -D -i ~/signing/profile-renamed.mobileprovision | head -5
 
           # Install the renamed profile in the MANUAL location.
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
