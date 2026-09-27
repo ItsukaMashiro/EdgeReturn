@@ -192,7 +192,7 @@ final class BackgroundKeeper: NSObject, CLLocationManagerDelegate, ObservableObj
         let t = Timer(timeInterval: 30, repeats: true) { [weak self] _ in
             self?.watchdogTick()
         }
-        RunLoop.main.add(t, for: .common)
+        RunLoop.main.add(t, forMode: .common)
         watchdog = t
     }
 

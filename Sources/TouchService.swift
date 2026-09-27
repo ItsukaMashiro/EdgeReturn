@@ -211,7 +211,7 @@ final class TouchService: NSObject, ObservableObject {
 
     private func beginTouch(index: Int, x: Float, y: Float) {
         let now = CACurrentMediaTime()
-        let inEdge = x >= UIScreen.main.bounds.width - CGFloat(edgeThreshold)
+        let inEdge = x >= Float(UIScreen.main.bounds.width) - edgeThreshold
         activeTouches[index] = TouchTrack(
             index: index, startX: x, startY: y, lastX: x, lastY: y,
             startTime: now, engaged: false, triggered: false, longPressFired: false
@@ -225,7 +225,7 @@ final class TouchService: NSObject, ObservableObject {
 
     private func moveTouch(index: Int, x: Float, y: Float) {
         guard var track = activeTouches[index], !track.triggered else { return }
-        let inEdge = track.startX >= UIScreen.main.bounds.width - CGFloat(edgeThreshold)
+        let inEdge = track.startX >= Float(UIScreen.main.bounds.width) - edgeThreshold
         guard inEdge else { return }
         track.lastX = x
         track.lastY = y
@@ -234,7 +234,7 @@ final class TouchService: NSObject, ObservableObject {
         checkLongPress(track)
         // Grow the edge indicator with the swipe (Android's drag indicator).
         let dx = x - track.startX
-        let progress = min(max(-dx / completeDistance, 0), 1)
+        let progress = Double(min(max(-dx / completeDistance, 0), 1))
         setEdgeIndicator(active: true, progress: progress)
     }
 
@@ -265,7 +265,7 @@ final class TouchService: NSObject, ObservableObject {
         guard longPressEnabled, !track.longPressFired, !track.triggered else { return }
         let held = CACurrentMediaTime() - track.startTime
         let drift = hypot(CGFloat(track.lastX - track.startX), CGFloat(track.lastY - track.startY))
-        guard held >= longPressDuration, drift <= longPressMaxDrift else { return }
+        guard held >= longPressDuration, drift <= CGFloat(longPressMaxDrift) else { return }
         if var t = activeTouches[track.index] {
             t.longPressFired = true
             t.triggered = true
@@ -284,7 +284,7 @@ final class TouchService: NSObject, ObservableObject {
         guard dx < 0 else { return }
         guard abs(dy) <= maxVerticalDrift else { return }
         let elapsed = max(CACurrentMediaTime() - track.startTime, 0.001)
-        let velocity = -dx / elapsed
+        let velocity = -dx / Float(elapsed)
         let byDistance = -dx >= completeDistance
         let byFlick = velocity >= flickVelocity
         guard byDistance || byFlick else {
@@ -411,7 +411,7 @@ final class TouchService: NSObject, ObservableObject {
                 self.checkLongPress(track)
             }
         }
-        RunLoop.main.add(t, for: .common)
+        RunLoop.main.add(t, forMode: .common)
         longPressTimer = t
     }
 
@@ -434,7 +434,7 @@ final class TouchService: NSObject, ObservableObject {
                 self.hapticEngine = try? CHHapticEngine()
             }
             guard let engine = self.hapticEngine else { return }
-            engine.start()
+            try? engine.start()
             let event = CHHapticEvent(eventType: .hapticTypeSteadyState, parameters: [
                 CHHapticEventParameter(parameterID: .hapticIntensityControl, value: intensity),
                 CHHapticEventParameter(parameterID: .hapticSharpnessControl, value: sharpness)
