@@ -25,3 +25,9 @@ DerivedData/
 signing/
 
 tools/__pycache__/
+
+# build artifacts / local temp
+*.ipa
+_ipa_check/
+archive.log
+build/
