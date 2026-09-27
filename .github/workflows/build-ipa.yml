@@ -78,8 +78,11 @@ jobs:
           rm -rf "$APP/_CodeSignature"
           rm -rf Payload && mkdir -p Payload
           cp -R "$APP" Payload/
-          ( cd Payload && zip -r -X ../build/EdgeReturn-unsigned.ipa . )
+          # Standard IPA layout: Payload/EdgeReturn.app/... (what
+          # LiveContainer / SideStore import expects).
+          zip -r -X build/EdgeReturn-unsigned.ipa Payload
           ls -la build/EdgeReturn-unsigned.ipa
+          unzip -l build/EdgeReturn-unsigned.ipa | head -n 20
 
       - name: Show app Info.plist
         run: |
