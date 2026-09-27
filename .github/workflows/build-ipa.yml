@@ -42,33 +42,33 @@ jobs:
         run: xcodegen generate
 
       # Unsigned device build. No keychain, no certificate, no provisioning
-      # profile: CODE_SIGNING_ALLOWED=NO. The output .app is signed later,
-      # on-device, by LiveContainer + SideStore (the same flow used for WDA).
+      # profile: CODE_SIGNING_ALLOWED=NO. `xcodebuild build` places the .app
+      # in DerivedData (unlike `archive`, which skips the Products/App copy
+      # when signing is off). The .app is signed later, on-device, by
+      # LiveContainer + SideStore (the same flow used for WDA).
       - name: Build (unsigned, device arm64)
         run: |
           set -e
           mkdir -p build
-          xcodebuild archive \
+          xcodebuild build \
             -project "$PROJECT" \
             -scheme "$SCHEME" \
             -configuration Release \
             -destination "generic/platform=iOS" \
-            -archivePath build/EdgeReturn.xcarchive \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY= \
-            | tee build/archive.log | tail -n 40
+            | tee build/build.log | tail -n 40
 
       - name: Package unsigned IPA
         run: |
           set -e
-          # Locate the built .app anywhere in the archive (the exact
-          # Products/App path varies by Xcode version / signing mode).
-          APP=$(find build/EdgeReturn.xcarchive -name "EdgeReturn.app" -type d | head -n 1)
+          # Locate the built .app in DerivedData (the build output dir).
+          APP=$(find "$HOME/Library/Developer/Xcode/DerivedData" -path "*Release-iphoneos/EdgeReturn.app" -type d 2>/dev/null | head -n 1)
           if [ -z "$APP" ] || [ ! -d "$APP" ]; then
-            echo "::error::Built EdgeReturn.app not found in the archive"
-            find build/EdgeReturn.xcarchive -maxdepth 4 -name "*.app" 2>/dev/null || true
-            tail -n 40 build/archive.log
+            echo "::error::Built EdgeReturn.app not found in DerivedData"
+            find "$HOME/Library/Developer/Xcode/DerivedData" -name "EdgeReturn.app" -type d 2>/dev/null || true
+            tail -n 40 build/build.log
             exit 1
           fi
           echo "Found app at: $APP"
@@ -83,7 +83,7 @@ jobs:
 
       - name: Show app Info.plist
         run: |
-          APP=$(find build/EdgeReturn.xcarchive -name "EdgeReturn.app" -type d | head -n 1)
+          APP=$(find "$HOME/Library/Developer/Xcode/DerivedData" -path "*Release-iphoneos/EdgeReturn.app" -type d 2>/dev/null | head -n 1)
           plutil -p "$APP/Info.plist" | head -n 40
 
       - name: Upload unsigned IPA artifact
@@ -97,4 +97,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: build-log
-          path: build/archive.log
+          path: build/build.log
