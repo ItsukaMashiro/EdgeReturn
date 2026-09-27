@@ -124,9 +124,19 @@ jobs:
           # macOS 26: the -t cert flag fails with "Import/Export format
           # unsupported"; omitting -t imports the P12 as an identity
           # (cert + key), which is what code signing needs.
-          security import ~/signing/cert.p12 \
+          # Import the P12. Some p12 encodings (e.g. empty-password MACs) are
+          # rejected by macOS `security import` even though openssl accepts
+          # them — fall back to PEM extraction + separate cert/key import,
+          # which the keychain links into an identity by subject match.
+          if ! security import ~/signing/cert.p12 \
             -P "$P12_PASSWORD" \
-            -k "$KEYCHAIN_PATH"
+            -k "$KEYCHAIN_PATH"; then
+            echo "P12 import failed — falling back to PEM extraction"
+            openssl pkcs12 -in ~/signing/cert.p12 -nokeys -passin "pass:$P12_PASSWORD" -out ~/signing/cert.pem
+            openssl pkcs12 -in ~/signing/cert.p12 -nocerts -passin "pass:$P12_PASSWORD" -nodes -out ~/signing/key.pem
+            security import ~/signing/cert.pem -t cert -k "$KEYCHAIN_PATH"
+            security import ~/signing/key.pem -t key -k "$KEYCHAIN_PATH"
+          fi
           # Allow the key to be used for code signing.
           security set-key-partition-list -S signing -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
