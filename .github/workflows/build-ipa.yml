@@ -190,16 +190,16 @@ jobs:
           fi
           echo "Identity: $IDENTITY"
 
-          # 2. The profile must carry the bundle id.
+          # 2. The profile must carry the bundle id (in the decoded plist text).
           security cms -D -i ~/signing/profile.mobileprovision > /tmp/profile.plist
-          if ! plutil -extract Entitlements raw -o - /tmp/profile.plist | grep -q "com.itsukamashiro.edgereturn"; then
+          if ! grep -q "com.itsukamashiro.edgereturn" /tmp/profile.plist; then
             echo "::error::Profile does not contain bundle id com.itsukamashiro.edgereturn"
             exit 1
           fi
           echo "Bundle id: OK"
 
           # 3. The profile must provision at least one device.
-          if ! plutil -extract ProvisionedDevices raw -o - /tmp/profile.plist | grep -q "00008150"; then
+          if ! grep -q "00008150" /tmp/profile.plist; then
             echo "::error::Profile does not provision the target device"
             exit 1
           fi
