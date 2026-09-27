@@ -23,3 +23,5 @@ DerivedData/
 
 # Signing working dir (certs, b64, logs)
 signing/
+
+tools/__pycache__/
