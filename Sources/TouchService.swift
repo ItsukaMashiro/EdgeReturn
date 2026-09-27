@@ -37,7 +37,6 @@ import Foundation
 import CoreGraphics
 import UIKit
 import QuartzCore
-import CoreHaptics
 
 final class TouchService: NSObject, ObservableObject {
 
@@ -101,7 +100,8 @@ final class TouchService: NSObject, ObservableObject {
     private var fnGetInt: GetIntFn?
 
     private var lastTriggerAt: Date = .distantPast
-    private var hapticEngine: CHHapticEngine?
+    private var impactLight: UIImpactFeedbackGenerator?
+    private var impactMedium: UIImpactFeedbackGenerator?
 
     /// One in-flight touch, keyed by the event's digitizer index (stable per
     /// finger, unlike a synthetic id we would have to invent ourselves).
@@ -419,32 +419,24 @@ final class TouchService: NSObject, ObservableObject {
 
     private func engageTick() {
         guard hapticsEnabled else { return }
-        playIntensity(0.35, sharpness: 0.8, duration: 0.04)
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            if self.impactLight == nil {
+                self.impactLight = UIImpactFeedbackGenerator(style: .light)
+            }
+            self.impactLight?.impactOccurred()
+        }
     }
 
     private func successTick() {
         guard hapticsEnabled else { return }
-        playIntensity(0.6, sharpness: 0.9, duration: 0.08)
-    }
-
-    private func playIntensity(_ intensity: Float, sharpness: Float, duration: TimeInterval) {
         DispatchQueue.main.async { [weak self] in
-            self?.playHaptic(intensity: intensity, sharpness: sharpness, duration: duration)
+            guard let self = self else { return }
+            if self.impactMedium == nil {
+                self.impactMedium = UIImpactFeedbackGenerator(style: .medium)
+            }
+            self.impactMedium?.impactOccurred()
         }
-    }
-
-    private func playHaptic(intensity: Float, sharpness: Float, duration: TimeInterval) {
-        if hapticEngine == nil {
-            hapticEngine = try? CHHapticEngine()
-        }
-        guard let engine = hapticEngine else { return }
-        try? engine.start()
-        let event = CHHapticEvent(eventType: .hapticTypeSteadyState, parameters: [
-            CHHapticEventParameter(parameterID: .hapticIntensityControl, value: intensity),
-            CHHapticEventParameter(parameterID: .hapticSharpnessControl, value: sharpness)
-        ], duration: duration)
-        guard let pattern = try? CHHapticPattern(events: [event], duration: duration + 0.02) else { return }
-        try? engine.play(pattern)
     }
 
     // MARK: - Edge indicator + event log (UI, main thread)
