@@ -19,6 +19,9 @@ env:
 jobs:
   build:
     runs-on: macos-latest
+    # Automatic signing tries to reach Apple's servers and can hang for
+    # hours on a runner. Manual signing (explicit profile UUID) never does.
+    timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -224,19 +227,22 @@ jobs:
       - name: Build (archive)
         run: |
           set -e -o pipefail
-          # The profile is Xcode-managed, so it requires Automatic signing
-          # (Manual style rejects Xcode-managed profiles). Force the exact
-          # profile by name via PROVISIONING_PROFILE_SPECIFIER.
+          # Manual signing with the explicit profile UUID: never talks to
+          # Apple's servers, so it cannot hang the way Automatic signing
+          # did on this runner (6h stall).
+          IDENTITY=$(security find-identity -v -p codesigning | grep -Eo '"[^"]+"' | head -n 1 | tr -d '"')
+          echo "Signing identity: $IDENTITY"
           xcodebuild archive \
             -project "$PROJECT" \
             -scheme "$SCHEME" \
             -configuration Release \
             -destination "generic/platform=iOS" \
             -archivePath build/EdgeReturn.xcarchive \
-            CODE_SIGN_STYLE=Automatic \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="$IDENTITY" \
             DEVELOPMENT_TEAM="$TEAM_ID" \
-            PROVISIONING_PROFILE_SPECIFIER="$NAME" \
-            | tail -n 60
+            PROVISIONING_PROFILE="$PROFILE_UUID" \
+            | tee build/archive.log | tail -n 60
 
       - name: Write export options
         run: |
@@ -285,3 +291,10 @@ jobs:
         with:
           name: EdgeReturn.ipa
           path: build/EdgeReturn.ipa
+
+      - name: Upload build log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build/archive.log
