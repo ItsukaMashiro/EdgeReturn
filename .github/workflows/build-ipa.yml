@@ -180,7 +180,7 @@ jobs:
           print(f"Profile valid until: {exp.isoformat() if exp else 'n/a'}")
           EOF
 
-      - name: Preflight: Apple reachability
+      - name: Preflight Apple reachability
         run: |
           # Automatic signing needs to reach Apple's developer services.
           # Probe with a short timeout so a blocked runner fails fast.
