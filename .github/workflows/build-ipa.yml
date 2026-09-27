@@ -211,7 +211,10 @@ jobs:
           with open("/tmp/profile.plist", "rb") as f:
             p = plistlib.load(f)
           exp = p.get("ExpirationDate")
-          now = datetime.datetime.now(datetime.timezone.utc)
+          # plistlib returns naive UTC datetimes for <date> elements.
+          now = datetime.datetime.utcnow()
+          if exp and exp.tzinfo is not None:
+            exp = exp.replace(tzinfo=None)
           if exp and exp < now:
             print(f"::error::Profile expired at {exp.isoformat()}")
             sys.exit(1)
