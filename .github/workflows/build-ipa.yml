@@ -131,7 +131,7 @@ jobs:
           security cms -D -i ~/signing/profile.mobileprovision > ~/signing/profile.plist
           sed -i '' 's|iOS Team Provisioning Profile: com.itsukamashiro.edgereturn|EdgeReturn-Dev|' ~/signing/profile.plist
           grep -A1 "<key>Name</key>" ~/signing/profile.plist || true
-          security cms -e -i ~/signing/profile.plist -o ~/signing/profile-renamed.mobileprovision
+          security cms -S -i ~/signing/profile.plist -o ~/signing/profile-renamed.mobileprovision
 
           # Install the renamed profile in the MANUAL location.
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
