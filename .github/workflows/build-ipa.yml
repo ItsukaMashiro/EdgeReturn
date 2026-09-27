@@ -123,9 +123,17 @@ jobs:
           security default-keychain -s "$KEYCHAIN_PATH"
           set_keychain_attrs "$KEYCHAIN_PATH" -u
 
-          # Install the provisioning profile.
+          # Install the provisioning profile in the MANUAL location.
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
           cp ~/signing/profile.mobileprovision "$HOME/Library/MobileDevice/Provisioning Profiles/"
+          # Xcode 15+ also keeps an "Xcode managed" store; a copy of the
+          # same UUID there makes xcodebuild classify the profile as
+          # "Xcode managed" and reject Manual signing. Clear it (fresh
+          # runner — nothing else lives there).
+          if [ -d "$HOME/Library/Developer/Xcode/UserData/ProvisioningProfiles" ]; then
+            rm -f "$HOME/Library/Developer/Xcode/UserData/ProvisioningProfiles/"* 2>/dev/null || true
+          fi
+          ls -la "$HOME/Library/MobileDevice/Provisioning Profiles/"
 
           # Extract identifiers from the profile.
           PROFILE_PLIST=$(mktemp)
@@ -192,6 +200,7 @@ jobs:
           # did on this runner (6h stall).
           IDENTITY=$(security find-identity -v -p codesigning | grep -Eo '"[^"]+"' | head -n 1 | tr -d '"')
           echo "Signing identity: $IDENTITY"
+          mkdir -p build
           xcodebuild archive \
             -project "$PROJECT" \
             -scheme "$SCHEME" \
