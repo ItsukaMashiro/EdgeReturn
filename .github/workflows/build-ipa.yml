@@ -2,25 +2,16 @@ name: Build EdgeReturn IPA
 
 on:
   workflow_dispatch:
-    inputs:
-      export_method:
-        description: "Export method (development / ad-hoc / release)"
-        required: false
-        default: "development"
   push:
     branches: [ main ]
 
 env:
-  KEYCHAIN_NAME: "edgeReturn-signing"
-  KEYCHAIN_PASSWORD: "edgeReturn-2024"
   SCHEME: "EdgeReturn"
   PROJECT: "EdgeReturn.xcodeproj"
 
 jobs:
   build:
     runs-on: macos-latest
-    # Automatic signing tries to reach Apple's servers and can hang for
-    # hours on a runner. Manual signing (explicit profile UUID) never does.
     timeout-minutes: 25
     steps:
       - name: Checkout
@@ -39,7 +30,6 @@ jobs:
             brew install xcodegen || true
           fi
           if ! command -v xcodegen >/dev/null 2>&1; then
-            # Fallback: prebuilt binary from GitHub releases.
             ARCH=$(uname -m)
             curl -L -o /tmp/xcodegen.zip "https://github.com/yonaskolb/XcodeGen/releases/latest/download/xcodegen-macos-${ARCH}.zip"
             unzip -o /tmp/xcodegen.zip -d /tmp/xcodegen-bin
@@ -51,157 +41,12 @@ jobs:
       - name: Generate Xcode project
         run: xcodegen generate
 
-      - name: Decode signing assets
-        env:
-          CERTIFICATE_P12: ${{ secrets.CERTIFICATE_P12 }}
-          PROVISIONING_PROFILE: ${{ secrets.PROVISIONING_PROFILE }}
+      # Unsigned device build. No keychain, no certificate, no provisioning
+      # profile: CODE_SIGNING_ALLOWED=NO. The output .app is signed later,
+      # on-device, by LiveContainer + SideStore (the same flow used for WDA).
+      - name: Build (unsigned, device arm64)
         run: |
           set -e
-          if [ -z "$CERTIFICATE_P12" ] || [ -z "$PROVISIONING_PROFILE" ]; then
-            echo "::error::CERTIFICATE_P12 or PROVISIONING_PROFILE secret is missing"
-            exit 1
-          fi
-          mkdir -p ~/signing
-          printf '%s' "$CERTIFICATE_P12" | base64 --decode > ~/signing/cert.p12
-          printf '%s' "$PROVISIONING_PROFILE" | base64 --decode > ~/signing/profile.mobileprovision
-          ls -la ~/signing
-          file ~/signing/cert.p12 ~/signing/profile.mobileprovision
-
-      - name: Import certificate & profile
-        env:
-          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
-        run: |
-          set -e
-          KEYCHAIN_PATH=$RUNNER_TEMP/$KEYCHAIN_NAME.keychain-db
-
-          # macOS 26 renamed `set-keychain-attrs` to `set-keychain-settings`
-          # and its parser requires flags before the keychain path
-          set_keychain_attrs() {
-            if security set-keychain-attrs -h >/dev/null 2>&1; then
-              security set-keychain-attrs "$@"
-            else
-              local path="$1"; shift
-              security set-keychain-settings "$@" "$path"
-            fi
-          }
-
-          # Fresh signing keychain
-          if [ -f "$KEYCHAIN_PATH" ]; then rm -f "$KEYCHAIN_PATH"; fi
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          set_keychain_attrs "$KEYCHAIN_PATH" -u
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-
-          # Import the P12 (certificate + private key)
-          # macOS 26: the -t cert flag fails with "Import/Export format
-          # unsupported"; omitting -t imports the P12 as an identity
-          # (cert + key), which is what code signing needs.
-          # Import the P12. Some p12 encodings (e.g. empty-password MACs) are
-          # rejected by macOS `security import` even though openssl accepts
-          # them — fall back to PEM extraction + separate cert/key import,
-          # which the keychain links into an identity by subject match.
-          # macOS 26 import matrix (see the Debug P12 step): default p12,
-          # then explicit -f pkcs12, then PEM cert + key with -f openssl.
-          if ! security import ~/signing/cert.p12 \
-            -P "$P12_PASSWORD" \
-            -k "$KEYCHAIN_PATH" 2>/dev/null; then
-            echo "P12 default import failed — trying -f pkcs12"
-            if ! security import ~/signing/cert.p12 \
-              -f pkcs12 -P "$P12_PASSWORD" \
-              -k "$KEYCHAIN_PATH" 2>/dev/null; then
-              echo "P12 -f pkcs12 import failed — falling back to PEM extraction"
-              openssl pkcs12 -in ~/signing/cert.p12 -nokeys -passin "pass:$P12_PASSWORD" -out ~/signing/cert.pem
-              openssl pkcs12 -in ~/signing/cert.p12 -nocerts -passin "pass:$P12_PASSWORD" -nodes -out ~/signing/key.pem
-              security import ~/signing/cert.pem -f openssl -t cert -k "$KEYCHAIN_PATH"
-              security import ~/signing/key.pem -f openssl -t priv -k "$KEYCHAIN_PATH"
-            fi
-          fi
-          # Allow the key to be used for code signing.
-          security set-key-partition-list -S signing -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-
-          # Make it the default and part of the search list.
-          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"' | tr '\n' ' ')
-          security default-keychain -s "$KEYCHAIN_PATH"
-          set_keychain_attrs "$KEYCHAIN_PATH" -u
-
-          # Extract identifiers from the profile.
-          PROFILE_PLIST=$(mktemp)
-          security cms -D -i ~/signing/profile.mobileprovision > "$PROFILE_PLIST"
-          # Newer Xcode profile format stores the UUID under `UUID`;
-          # older profiles use `ProvisioningProfileUUID`.
-          PROFILE_UUID=$(plutil -extract UUID raw -o - "$PROFILE_PLIST" 2>/dev/null || plutil -extract ProvisioningProfileUUID raw -o - "$PROFILE_PLIST")
-          TEAM_ID=$(plutil -extract TeamIdentifier.0 raw -o - "$PROFILE_PLIST")
-          NAME=$(plutil -extract Name raw -o - "$PROFILE_PLIST" || echo "EdgeReturn")
-          echo "Profile: $NAME (UUID $PROFILE_UUID, team $TEAM_ID)"
-
-          {
-            echo "PROFILE_UUID=$PROFILE_UUID"
-            echo "TEAM_ID=$TEAM_ID"
-          } >> "$GITHUB_ENV"
-
-      - name: "Preflight: verify signing chain"
-        run: |
-          set -e
-          # 1. The imported identity must be a valid codesigning identity.
-          IDENTITY=$(security find-identity -v -p codesigning | head -n 1)
-          if [ -z "$IDENTITY" ]; then
-            echo "::error::No valid codesigning identity found after import"
-            exit 1
-          fi
-          echo "Identity: $IDENTITY"
-
-          # 2. The profile must carry the bundle id (in the decoded plist text).
-          security cms -D -i ~/signing/profile.mobileprovision > /tmp/profile.plist
-          if ! grep -q "com.itsukamashiro.edgereturn" /tmp/profile.plist; then
-            echo "::error::Profile does not contain bundle id com.itsukamashiro.edgereturn"
-            exit 1
-          fi
-          echo "Bundle id: OK"
-
-          # 3. The profile must provision at least one device.
-          if ! grep -q "00008150" /tmp/profile.plist; then
-            echo "::error::Profile does not provision the target device"
-            exit 1
-          fi
-          echo "Device: OK"
-
-          # 4. The profile must not be expired.
-          python3 - <<'EOF'
-          import plistlib, sys, datetime
-          with open("/tmp/profile.plist", "rb") as f:
-            p = plistlib.load(f)
-          exp = p.get("ExpirationDate")
-          # plistlib returns naive UTC datetimes for <date> elements.
-          now = datetime.datetime.utcnow()
-          if exp and exp.tzinfo is not None:
-            exp = exp.replace(tzinfo=None)
-          if exp and exp < now:
-            print(f"::error::Profile expired at {exp.isoformat()}")
-            sys.exit(1)
-          print(f"Profile valid until: {exp.isoformat() if exp else 'n/a'}")
-          EOF
-
-      - name: Preflight Apple reachability
-        run: |
-          # Automatic signing needs to reach Apple's developer services.
-          # Probe with a short timeout so a blocked runner fails fast.
-          if curl -sS -m 15 -o /dev/null -w "developerservices2.apple.com -> %{http_code}\n" \
-               "https://developerservices2.apple.com/services/QH65B2/ios/listTeams.action?clientId=XABBG36SBA" ; then
-            echo "Apple reachable"
-          else
-            echo "::warning::Apple developer services not reachable (Automatic signing may hang)"
-          fi
-
-      - name: Build (archive, automatic signing)
-        run: |
-          set -e
-          # Automatic signing: xcodebuild downloads and manages the
-          # provisioning profile itself, so the profile's Name pattern
-          # ("iOS Team Provisioning Profile: ...") does NOT trigger the
-          # "Xcode managed but Manual signing" rejection. The certificate
-          # is in the keychain (import step). A hard watchdog kills the
-          # build after 600s in case Apple reachability hangs.
-          IDENTITY=$(security find-identity -v -p codesigning | grep -Eo '"[^"]+"' | head -n 1 | tr -d '"')
-          echo "Signing identity: $IDENTITY"
           mkdir -p build
           xcodebuild archive \
             -project "$PROJECT" \
@@ -209,76 +54,41 @@ jobs:
             -configuration Release \
             -destination "generic/platform=iOS" \
             -archivePath build/EdgeReturn.xcarchive \
-            -allowProvisioningUpdates \
-            CODE_SIGN_STYLE=Automatic \
-            DEVELOPMENT_TEAM="$TEAM_ID" \
-            > build/archive.log 2>&1 &
-          XCODE_PID=$!
-          echo "xcodebuild PID: $XCODE_PID"
-          for i in $(seq 1 600); do
-            if ! kill -0 "$XCODE_PID" 2>/dev/null; then break; fi
-            sleep 1
-          done
-          if kill -0 "$XCODE_PID" 2>/dev/null; then
-            echo "::error::xcodebuild timed out after 600s (Automatic signing likely hung on Apple reachability)"
-            kill "$XCODE_PID" 2>/dev/null || true
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= \
+            | tee build/archive.log | tail -n 40
+
+      - name: Package unsigned IPA
+        run: |
+          set -e
+          APP=build/EdgeReturn.xcarchive/Products/App/EdgeReturn.app
+          if [ ! -d "$APP" ]; then
+            echo "::error::Built app not found at $APP"
             tail -n 40 build/archive.log
             exit 1
           fi
-          set +e
-          wait "$XCODE_PID"
-          STATUS=$?
-          set -e
-          tail -n 60 build/archive.log
-          exit $STATUS
+          # Confirm it is a device (arm64) binary, not simulator.
+          lipo -info "$APP/EdgeReturn" || true
+          rm -rf Payload && mkdir -p Payload
+          cp -R "$APP" Payload/
+          ( cd Payload && zip -r -X ../EdgeReturn-unsigned.ipa . )
+          ls -la build/EdgeReturn-unsigned.ipa
+          # Strip the (empty) _CodeSignature so on-device signers start clean.
+          rm -rf Payload/EdgeReturn.app/_CodeSignature
+          rm -f build/EdgeReturn-unsigned.ipa
+          ( cd Payload && zip -r -X ../EdgeReturn-unsigned.ipa . )
+          ls -la build/EdgeReturn-unsigned.ipa
 
-      - name: Write export options
+      - name: Show app Info.plist
         run: |
-          set -e
-          METHOD="${{ github.event.inputs.export_method || 'development' }}"
-          cat > ExportOptions.plist <<EOF
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>method</key>
-            <string>$METHOD</string>
-            <key>teamID</key>
-            <string>$TEAM_ID</string>
-            <key>uploadSymbols</key>
-            <true/>
-            <key>compileBitcode</key>
-            <false/>
-          </dict>
-          </plist>
-          EOF
-          cat ExportOptions.plist
+          plutil -p build/EdgeReturn.xcarchive/Products/App/EdgeReturn.app/Info.plist | head -n 40
 
-      - name: Export IPA
-        run: |
-          set -e -o pipefail
-          xcodebuild -exportArchive \
-            -archivePath build/EdgeReturn.xcarchive \
-            -optionsPlist ExportOptions.plist \
-            -outputPath build/EdgeReturn.ipa \
-            | tail -n 40
-          ls -la build/
-
-      - name: Verify IPA signature
-        run: |
-          set -e
-          rm -rf /tmp/ipa && mkdir -p /tmp/ipa
-          unzip -q "$GITHUB_WORKSPACE/build/EdgeReturn.ipa" -d /tmp/ipa
-          APP=$(ls -d /tmp/ipa/Payload/*.app)
-          codesign -vvv "$APP"
-          codesign -d --entitlements - "$APP" || true
-          echo "Signature: OK"
-
-      - name: Upload IPA artifact
+      - name: Upload unsigned IPA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: EdgeReturn.ipa
-          path: build/EdgeReturn.ipa
+          name: EdgeReturn-unsigned.ipa
+          path: build/EdgeReturn-unsigned.ipa
 
       - name: Upload build log (on failure)
         if: failure()
