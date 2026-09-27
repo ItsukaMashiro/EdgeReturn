@@ -31,8 +31,17 @@ jobs:
 
       - name: Install XcodeGen
         run: |
+          set -e
           if ! command -v xcodegen >/dev/null 2>&1; then
             brew install xcodegen || true
+          fi
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            # Fallback: prebuilt binary from GitHub releases.
+            ARCH=$(uname -m)
+            curl -L -o /tmp/xcodegen.zip "https://github.com/yonaskolb/XcodeGen/releases/latest/download/xcodegen-macos-${ARCH}.zip"
+            unzip -o /tmp/xcodegen.zip -d /tmp/xcodegen-bin
+            chmod +x /tmp/xcodegen-bin/xcodegen
+            sudo mv /tmp/xcodegen-bin/xcodegen /usr/local/bin/xcodegen
           fi
           xcodegen --version
 
@@ -45,10 +54,15 @@ jobs:
           PROVISIONING_PROFILE: ${{ secrets.PROVISIONING_PROFILE }}
         run: |
           set -e
+          if [ -z "$CERTIFICATE_P12" ] || [ -z "$PROVISIONING_PROFILE" ]; then
+            echo "::error::CERTIFICATE_P12 or PROVISIONING_PROFILE secret is missing"
+            exit 1
+          fi
           mkdir -p ~/signing
-          echo "${{ secrets.CERTIFICATE_P12 }}" | base64 --decode > ~/signing/cert.p12
-          echo "${{ secrets.PROVISIONING_PROFILE }}" | base64 --decode > ~/signing/profile.mobileprovision
+          printf '%s' "$CERTIFICATE_P12" | base64 --decode > ~/signing/cert.p12
+          printf '%s' "$PROVISIONING_PROFILE" | base64 --decode > ~/signing/profile.mobileprovision
           ls -la ~/signing
+          file ~/signing/cert.p12 ~/signing/profile.mobileprovision
 
       - name: Import certificate & profile
         env:
@@ -63,24 +77,23 @@ jobs:
           security set-keychain-attrs "$KEYCHAIN_PATH" -u
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-          # Import the P12 (certificate + private key)
+          # Import the P12 (certificate + private key) as an identity.
+          # NOTE: do NOT pass -t cert — that would drop the private key.
           security import ~/signing/cert.p12 \
             -P "$P12_PASSWORD" \
-            -t cert \
             -k "$KEYCHAIN_PATH"
-          # Allow the key to be used for code signing
+          # Allow the key to be used for code signing.
           security set-key-partition-list -S signing -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-          # Make it the default and part of the search list
+          # Make it the default and part of the search list.
           security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"' | tr '\n' ' ')
           security default-keychain -s "$KEYCHAIN_PATH"
-          security set-keychain-attrs "$KEYCHAIN_PATH" -u
 
-          # Install the provisioning profile
+          # Install the provisioning profile.
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
           cp ~/signing/profile.mobileprovision "$HOME/Library/MobileDevice/Provisioning Profiles/"
 
-          # Extract identifiers from the profile
+          # Extract identifiers from the profile.
           PROFILE_PLIST=$(mktemp)
           security cms -D -i ~/signing/profile.mobileprovision > "$PROFILE_PLIST"
           PROFILE_UUID=$(plutil -extract ProvisioningProfileUUID raw -o - "$PROFILE_PLIST")
@@ -93,9 +106,49 @@ jobs:
             echo "TEAM_ID=$TEAM_ID"
           } >> "$GITHUB_ENV"
 
+      - name: Preflight: verify signing chain
+        run: |
+          set -e
+          # 1. The imported identity must be a valid codesigning identity.
+          IDENTITY=$(security find-identity -v -p codesigning | head -n 1)
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::No valid codesigning identity found after import"
+            exit 1
+          fi
+          echo "Identity: $IDENTITY"
+
+          # 2. The profile must carry the bundle id.
+          security cms -D -i ~/signing/profile.mobileprovision > /tmp/profile.plist
+          if ! plutil -extract Entitlements raw -o - /tmp/profile.plist | grep -q "com.itsukamashiro.edgereturn"; then
+            echo "::error::Profile does not contain bundle id com.itsukamashiro.edgereturn"
+            exit 1
+          fi
+          echo "Bundle id: OK"
+
+          # 3. The profile must provision at least one device.
+          if ! plutil -extract ProvisionedDevices raw -o - /tmp/profile.plist | grep -q "00008150"; then
+            echo "::error::Profile does not provision the target device"
+            exit 1
+          fi
+          echo "Device: OK"
+
+          # 4. The profile must not be expired.
+          python3 - <<'EOF'
+          import plistlib, sys, datetime
+          with open("/tmp/profile.plist", "rb") as f:
+            p = plistlib.load(f)
+          exp = p.get("ExpirationDate")
+          now = datetime.datetime.now(datetime.timezone.utc)
+          if exp and exp < now:
+            print(f"::error::Profile expired at {exp.isoformat()}")
+            sys.exit(1)
+          print(f"Profile valid until: {exp.isoformat() if exp else 'n/a'}")
+          EOF
+
       - name: Build (archive)
         run: |
           set -e
+          set -o pipefail
           xcodebuild archive \
             -project "$PROJECT" \
             -scheme "$SCHEME" \
@@ -132,12 +185,23 @@ jobs:
       - name: Export IPA
         run: |
           set -e
+          set -o pipefail
           xcodebuild -exportArchive \
             -archivePath build/EdgeReturn.xcarchive \
             -optionsPlist ExportOptions.plist \
             -outputPath build/EdgeReturn.ipa \
             | tail -n 40
           ls -la build/
+
+      - name: Verify IPA signature
+        run: |
+          set -e
+          rm -rf /tmp/ipa && mkdir -p /tmp/ipa
+          unzip -q "$GITHUB_WORKSPACE/build/EdgeReturn.ipa" -d /tmp/ipa
+          APP=$(ls -d /tmp/ipa/Payload/*.app)
+          codesign -vvv "$APP"
+          codesign -d --entitlements - "$APP" || true
+          echo "Signature: OK"
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4

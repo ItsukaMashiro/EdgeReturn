@@ -1,98 +1,80 @@
 //
 //  ContentView.swift
-//  Main UI: enable the service, tune sensitivity, watch live touch events, and
-//  test the back injection.
+//  Main UI: enable the service, tune sensitivity, watch service status,
+//  preview the live edge indicator, and test the gesture injection.
+//  All settings persist across launches (UserDefaults via @AppStorage).
 //
 
 import SwiftUI
 
-final class UIState: ObservableObject {
-    @Published var backEnabled = false
-    @Published var edgeThreshold: Double = 28
-    @Published var minSwipeDistance: Double = 55
-    @Published var observing = false
-    @Published var locationActive = false
-    @Published var audioActive = false
-    @Published var lastTouch: CGPoint? = nil
-    @Published var touchDown = false
-    @Published var backFlash = false
-    @Published var touchCount = 0
-
-    private var flashReset: DispatchWorkItem?
-
-    func start() {
-        let svc = TouchService.shared
-        svc.onTouchSample = { [weak self] location, down in
-            DispatchQueue.main.async {
-                self?.lastTouch = location
-                self?.touchDown = down
-                self?.touchCount += 1
-            }
-        }
-        svc.onBackInjected = { [weak self] in
-            DispatchQueue.main.async { self?.flashBack() }
-        }
-        refresh()
-        // Poll status periodically.
-        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
-            self.refresh()
-        }
-    }
-
-    func refresh() {
-        let svc = TouchService.shared
-        observing = svc.observing
-        svc.edgeThreshold = CGFloat(edgeThreshold)
-        svc.minSwipeDistance = CGFloat(minSwipeDistance)
-        svc.backEnabled = backEnabled
-        locationActive = BackgroundKeeper.shared.locationActive
-        audioActive = BackgroundKeeper.shared.audioActive
-    }
-
-    private func flashBack() {
-        backFlash = true
-        flashReset?.cancel()
-        let item = DispatchWorkItem { self.backFlash = false }
-        flashReset = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: item)
-    }
-
-    func testBack() {
-        TouchService.shared.testBack()
-    }
-}
-
 struct ContentView: View {
-    @StateObject private var state = UIState()
+    @ObservedObject private var svc = TouchService.shared
+    @ObservedObject private var keeper = BackgroundKeeper.shared
+
+    // Persisted tuning.
+    @AppStorage("edgeThreshold") private var edgeThreshold: Double = 28
+    @AppStorage("engageDistance") private var engageDistance: Double = 35
+    @AppStorage("completeDistance") private var completeDistance: Double = 55
+    @AppStorage("backEnabled") private var backEnabled = true
+    @AppStorage("longPressEnabled") private var longPressEnabled = false
+    @AppStorage("hapticsEnabled") private var hapticsEnabled = true
+    @AppStorage("preventSleep") private var preventSleep = false
+
+    @State private var backFlash = false
 
     var body: some View {
-        ZStack {
+        ZStack(alignment: .trailing) {
             Color.black.ignoresSafeArea()
 
-            VStack(spacing: 18) {
-                header
-                statusRow
-                toggleSection
-                sensitivitySection
-                Spacer(minLength: 8)
-                debugView
-                testButton
+            ScrollView {
+                VStack(spacing: 16) {
+                    header
+                    statusRow
+                    gestureSection
+                    sensitivitySection
+                    serviceSection
+                    testSection
+                    eventLogSection
+                }
+                .padding(20)
             }
-            .padding(20)
 
-            // Full-screen live touch overlay (behind the controls).
-            TouchOverlay(lastTouch: state.lastTouch, touchDown: state.touchDown)
-                .allowsHitTesting(false)
+            // Live edge indicator: a thin bar on the RIGHT edge (Android's
+            // drag indicator) that lights up and grows while a touch is in
+            // the edge zone.
+            edgeIndicator
 
-            // Back-injected flash.
-            if state.backFlash {
-                BackFlash()
-                    .allowsHitTesting(false)
+            if backFlash {
+                BackFlash().allowsHitTesting(false)
             }
         }
-        .onAppear { state.start() }
+        .onAppear {
+            syncTuning()
+            TouchService.shared.startObserving()
+            BackgroundKeeper.shared.start()
+        }
+        .onChange(of: svc.lastBackAt) { _ in flashBack() }
+        .onChange(of: edgeThreshold) { _ in svc.edgeThreshold = Float(edgeThreshold) }
+        .onChange(of: engageDistance) { _ in svc.engageDistance = Float(engageDistance) }
+        .onChange(of: completeDistance) { _ in svc.completeDistance = Float(completeDistance) }
+        .onChange(of: backEnabled) { _ in svc.backEnabled = backEnabled }
+        .onChange(of: longPressEnabled) { _ in svc.longPressEnabled = longPressEnabled }
+        .onChange(of: hapticsEnabled) { _ in svc.hapticsEnabled = hapticsEnabled }
+        .onChange(of: preventSleep) { _ in keeper.preventSleep = preventSleep }
         .preferredColorScheme(.dark)
     }
+
+    private func syncTuning() {
+        svc.edgeThreshold = Float(edgeThreshold)
+        svc.engageDistance = Float(engageDistance)
+        svc.completeDistance = Float(completeDistance)
+        svc.backEnabled = backEnabled
+        svc.longPressEnabled = longPressEnabled
+        svc.hapticsEnabled = hapticsEnabled
+        keeper.preventSleep = preventSleep
+    }
+
+    // MARK: - Sections
 
     private var header: some View {
         VStack(spacing: 4) {
@@ -107,128 +89,232 @@ struct ContentView: View {
     }
 
     private var statusRow: some View {
-        HStack(spacing: 10) {
-            StatusPill(label: "Observe", on: state.observing)
-            StatusPill(label: "Location", on: state.locationActive)
-            StatusPill(label: "Audio", on: state.audioActive)
+        HStack(spacing: 8) {
+            StatusPill(label: "HID", on: svc.isObserving)
+            StatusPill(label: "Location", on: keeper.locationActive)
+            StatusPill(label: "Audio", on: keeper.audioActive)
+            StatusPill(label: "Watchdog", on: keeper.watchdogBeats > 0)
             Spacer()
-            Text("\(state.touchCount)")
-                .font(.caption.monospacedDigit())
-                .foregroundColor(.white.opacity(0.4))
         }
     }
 
-    private var toggleSection: some View {
+    private var gestureSection: some View {
         VStack(spacing: 12) {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Enable back swipe")
-                        .font(.headline)
-                        .foregroundColor(.white)
-                    Text("Swipe from the right edge to go back")
-                        .font(.caption)
-                        .foregroundColor(.white.opacity(0.5))
-                }
-                Spacer()
-                Toggle("", isOn: $state.backEnabled)
-                    .labelsHidden()
-                    .onChange(of: state.backEnabled) { _ in state.refresh() }
+            Toggle(isOn: $backEnabled) {
+                Text("Right-edge swipe → back")
+                    .font(.body).foregroundColor(.white)
             }
-            .padding(14)
-            .background(RoundedRectangle(cornerRadius: 14).fill(Color.white.opacity(0.06)))
-        }
-    }
+            .tint(.green)
 
-    private var sensitivitySection: some View {
-        VStack(spacing: 14) {
-            slider(title: "Edge width", value: $state.edgeThreshold, range: 10...80, unit: "pt")
-            slider(title: "Swipe distance", value: $state.minSwipeDistance, range: 30...150, unit: "pt")
+            Toggle(isOn: $longPressEnabled) {
+                Text("Long-press edge → home / apps")
+                    .font(.body).foregroundColor(.white)
+            }
+            .tint(.green)
+
+            Toggle(isOn: $hapticsEnabled) {
+                Text("Haptic ticks (Android feel)")
+                    .font(.body).foregroundColor(.white)
+            }
+            .tint(.green)
+
+            Toggle(isOn: $preventSleep) {
+                Text("Keep screen awake")
+                    .font(.body).foregroundColor(.white)
+            }
+            .tint(.green)
         }
         .padding(14)
         .background(RoundedRectangle(cornerRadius: 14).fill(Color.white.opacity(0.06)))
     }
 
-    private func slider(title: String, value: Binding<Double>, range: ClosedRange<Double>, unit: String) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+    private var sensitivitySection: some View {
+        VStack(spacing: 14) {
+            Text("Sensitivity")
+                .font(.headline)
+                .foregroundColor(.white)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            sliderRow(title: "Edge width", value: $edgeThreshold, range: 12...60, unit: "pt")
+            sliderRow(title: "Engage distance", value: $engageDistance, range: 20...80, unit: "pt")
+            sliderRow(title: "Complete distance", value: $completeDistance, range: 30...120, unit: "pt")
+        }
+        .padding(14)
+        .background(RoundedRectangle(cornerRadius: 14).fill(Color.white.opacity(0.06)))
+    }
+
+    private func sliderRow(title: String, value: Binding<Double>, range: ClosedRange<Double>, unit: String) -> some View {
+        VStack(spacing: 4) {
             HStack {
-                Text(title).font(.subheadline).foregroundColor(.white)
+                Text(title)
+                    .font(.subheadline)
+                    .foregroundColor(.white.opacity(0.8))
                 Spacer()
                 Text("\(Int(value.wrappedValue)) \(unit)")
-                    .font(.caption.monospacedDigit())
+                    .font(.subheadline.monospacedDigit())
                     .foregroundColor(.white.opacity(0.6))
             }
             Slider(value: value, in: range)
-                .tint(.orange)
-                .onChange(of: value.wrappedValue) { _ in state.refresh() }
+                .tint(.green)
         }
     }
 
-    private var debugView: some View {
+    private var serviceSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Live touch events")
-                .font(.subheadline)
-                .foregroundColor(.white.opacity(0.7))
-            Text(state.lastTouch.map { "x: \(Int($0.x))  y: \(Int($0.y))" } ?? "waiting…")
-                .font(.caption.monospaced())
-                .foregroundColor(state.lastTouch == nil ? .white.opacity(0.3) : .green)
+            HStack {
+                Label("Gesture engine", systemImage: "cpu")
+                    .font(.caption)
+                    .foregroundColor(svc.hidAvailable ? .green : .orange)
+                Spacer()
+                Text(svc.hidDetail)
+                    .font(.caption.monospaced())
+                    .foregroundColor(.white.opacity(0.6))
+            }
+            HStack {
+                Label("App state", systemImage: keeper.inBackground ? "moon.fill" : "sun.max.fill")
+                    .font(.caption)
+                    .foregroundColor(keeper.inBackground ? .orange : .green)
+                Spacer()
+                Text(keeper.inBackground ? "background (keep-alive active)" : "foreground")
+                    .font(.caption.monospaced())
+                    .foregroundColor(.white.opacity(0.6))
+            }
+            HStack {
+                Label("Location auth", systemImage: "location")
+                    .font(.caption)
+                    .foregroundColor(keeper.locationDenied ? .red : .green)
+                Spacer()
+                if keeper.locationDenied {
+                    Button("Open Settings") { keeper.openAppSettings() }
+                        .font(.caption)
+                        .buttonStyle(.bordered)
+                        .tint(.orange)
+                } else {
+                    Text(keeper.locationActive ? "granted" : "pending")
+                        .font(.caption.monospaced())
+                        .foregroundColor(.white.opacity(0.6))
+                }
+            }
+            if let last = svc.lastBackAt {
+                HStack {
+                    Label("Last back", systemImage: "chevron.left")
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                    Spacer()
+                    Text(last, style: .time)
+                        .font(.caption.monospaced())
+                        .foregroundColor(.white.opacity(0.6))
+                }
+            }
+            if let last = svc.lastHomeAt {
+                HStack {
+                    Label("Last home", systemImage: "house")
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                    Spacer()
+                    Text(last, style: .time)
+                        .font(.caption.monospaced())
+                        .foregroundColor(.white.opacity(0.6))
+                }
+            }
+            Text("Keep-alive: location + silent audio + watchdog. Grant \"Always\" for location when asked. iOS may still kill the app under extreme memory pressure — relaunch to resume.")
+                .font(.caption2)
+                .foregroundColor(.white.opacity(0.4))
         }
+        .padding(14)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
-        .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.05)))
+        .background(RoundedRectangle(cornerRadius: 14).fill(Color.white.opacity(0.06)))
     }
 
-    private var testButton: some View {
-        Button(action: { state.testBack() }) {
-            Text("Test back (inject left-edge swipe)")
-                .font(.subheadline.weight(.semibold))
+    private var testSection: some View {
+        HStack(spacing: 10) {
+            Button { svc.testBack() } label: {
+                HStack {
+                    Image(systemName: "chevron.left")
+                    Text("Test back")
+                }
+                .font(.body.weight(.semibold))
                 .foregroundColor(.black)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 12)
-                .background(RoundedRectangle(cornerRadius: 12).fill(.orange))
+                .background(RoundedRectangle(cornerRadius: 12).fill(Color.orange))
+            }
+            .disabled(!svc.isObserving)
+            .opacity(svc.isObserving ? 1 : 0.5)
+
+            Button { svc.testHome() } label: {
+                HStack {
+                    Image(systemName: "house")
+                    Text("Test home")
+                }
+                .font(.body.weight(.semibold))
+                .foregroundColor(.black)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+                .background(RoundedRectangle(cornerRadius: 12).fill(Color.green))
+            }
+            .disabled(!svc.isObserving)
+            .opacity(svc.isObserving ? 1 : 0.5)
         }
     }
-}
 
-// MARK: - Live touch overlay
-
-struct TouchOverlay: View {
-    let lastTouch: CGPoint?
-    let touchDown: Bool
-
-    var body: some View {
-        GeometryReader { geo in
-            ZStack {
-                // Right-edge highlight band.
-                Rectangle()
-                    .fill(Color.orange.opacity(0.08))
-                    .frame(width: 40)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-
-                if let p = lastTouch {
-                    Circle()
-                        .fill(touchDown ? Color.green : Color.green.opacity(0.35))
-                        .frame(width: touchDown ? 26 : 16, height: touchDown ? 26 : 16)
-                        .position(x: p.x, y: p.y)
+    private var eventLogSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Event log")
+                .font(.headline)
+                .foregroundColor(.white)
+            if svc.eventLog.isEmpty {
+                Text("No events yet — swipe in from the right edge.")
+                    .font(.caption)
+                    .foregroundColor(.white.opacity(0.4))
+            } else {
+                ForEach(svc.eventLog, id: \.self) { line in
+                    Text(line)
+                        .font(.caption2.monospaced())
+                        .foregroundColor(.white.opacity(0.55))
+                        .lineLimit(1)
                 }
             }
-            .frame(width: geo.size.width, height: geo.size.height)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 14).fill(Color.white.opacity(0.06)))
+    }
+
+    // MARK: - Live edge indicator (right edge, Android drag indicator)
+
+    private var edgeIndicator: some View {
+        GeometryReader { geo in
+            Capsule()
+                .fill(svc.edgeTouchActive ? Color.orange : Color.white.opacity(0.15))
+                .frame(width: 4, height: max(44, 44 + CGFloat(svc.edgeTouchProgress) * geo.size.height * 0.35))
+                .shadow(color: svc.edgeTouchActive ? Color.orange.opacity(0.8) : .clear, radius: 6)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
+                .padding(.trailing, 3)
+                .animation(.easeOut(duration: 0.12), value: svc.edgeTouchActive)
+        }
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+    }
+
+    private func flashBack() {
+        backFlash = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            backFlash = false
         }
     }
 }
 
-// MARK: - Back flash feedback
+// MARK: - Back flash
 
 struct BackFlash: View {
     var body: some View {
-        ZStack {
-            Color.black.opacity(0.001)
-            HStack {
-                Spacer()
-                Image(systemName: "chevron.left")
-                    .font(.system(size: 60, weight: .bold))
-                    .foregroundColor(.orange)
-                    .padding(.trailing, 24)
-            }
+        HStack {
+            Spacer()
+            Image(systemName: "chevron.left")
+                .font(.system(size: 60, weight: .bold))
+                .foregroundColor(.orange)
+                .padding(.trailing, 24)
         }
         .transition(.opacity)
     }

@@ -39,16 +39,10 @@
 	<array>
 		<string>location</string>
 		<string>audio</string>
-		<string>fetch</string>
-		<string>remote-notification</string>
 	</array>
 	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
 	<string>EdgeReturn keeps a lightweight location signal active so the swipe-back service stays alive in the background.</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>EdgeReturn uses location to keep the swipe-back service running in the background.</string>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>Not used.</string>
-	<key>UIBackgroundAudio</key>
-	<true/>
 </dict>
 </plist>

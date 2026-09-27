@@ -1,288 +1,452 @@
 //
 //  TouchService.swift
-//  Observes system-wide touch events via the private IOKit HID API and injects
-//  synthetic touches (used to trigger the native left-edge back gesture).
+//  Android-style right-edge swipe-back engine.
 //
-//  The core idea:
-//    1. We create an IOHIDEventSystemClient and register an event dispatch
-//       callback. The system feeds us raw touch (digitizer) events from every
-//       app on the device.
-//    2. We watch for a touch that begins near the RIGHT edge and travels left
-//       (Android-style back swipe).
-//    3. When detected, we inject a synthetic LEFT-edge swipe, which is iOS's
-//       native back gesture. Any app with back navigation then pops.
+//  Two backends feed one gesture model:
+//
+//  1. System-wide: a private IOKit HID event-system client observes raw
+//     digitizer events from every app (works even while we sit in the
+//     background). All private symbols are resolved with dlopen/dlsym at
+//     runtime; if a future iOS release removes them, `hidAvailable` is
+//     false and the rest of the app degrades gracefully.
+//
+//  2. Foreground fallback: a UIScreenEdgePanGestureRecognizer on the app's
+//     own window (right edge), active only when the private API is
+//     unavailable, so the gesture still works inside this app.
+//
+//  The gesture model mirrors Android's edge navigation:
+//
+//  - a touch that starts within `edgeThreshold` of the right edge is "in
+//    the edge" (a light haptic tick, like Android's drag indicator
+//    appearing);
+//  - moving horizontally past `engageDistance` engages the gesture (a
+//    second, firmer tick);
+//  - releasing past `completeDistance`, or flicking at or above
+//    `flickVelocity`, completes it. The synthetic swipe we inject is
+//    PACED TO THE USER'S ACTUAL SWIPE TIME (clamped 0.12s...0.4s), so the
+//    native back animation follows the pace of your finger — the core of
+//    the Android feel;
+//  - a long-press in the edge zone (optional, `longPressEnabled`) injects
+//    a bottom-edge swipe (home / app switcher), like Android's
+//    long-press-edge;
+//  - releasing short of the thresholds cancels (indicator fades out),
+//    exactly like Android's cancelable drag.
 //
 
 import Foundation
-import CoreGraphics
-import IOKit
 import UIKit
+import QuartzCore
+import CoreHaptics
 
-final class TouchService: NSObject {
-    static let shared = TouchService()
+final class TouchService: NSObject, ObservableObject {
 
-    // MARK: - Tunable configuration
+    // MARK: - Published state (UI)
 
-    /// Distance (in points) from the right edge within which a touch is
-    /// considered an "edge" touch.
-    var edgeThreshold: CGFloat = 28
+    @Published var isObserving = false
+    @Published var hidAvailable = false
+    @Published var hidDetail = "not loaded"
+    @Published var lastBackAt: Date?
+    @Published var lastHomeAt: Date?
+    @Published var edgeTouchActive = false
+    @Published var edgeTouchProgress: Double = 0
+    @Published private(set) var eventLog: [String] = []
 
-    /// Minimum leftward travel (in points) required to count as a back swipe.
-    var minSwipeDistance: CGFloat = 55
+    // MARK: - Tuning (persisted by the UI layer)
 
-    /// Master switch. When false, swipes are observed (for the debug view) but
-    /// no back action is injected.
-    var backEnabled: Bool = false
+    /// Distance from the right edge within which a touch starts a swipe (pt).
+    var edgeThreshold: Float = 28
+    /// Horizontal travel (pt) at which the gesture engages (haptic tick).
+    var engageDistance: Float = 35
+    /// Horizontal travel (pt) past which a release completes the back.
+    var completeDistance: Float = 55
+    /// Horizontal velocity (pt/s) that completes the back even short of the
+    /// distance threshold (a flick).
+    var flickVelocity: Float = 500
+    /// Maximum vertical drift (pt) before the gesture is rejected.
+    var maxVerticalDrift: Float = 45
+    /// How long a touch must stay in the edge zone to count as a long-press (s).
+    var longPressDuration: TimeInterval = 0.5
+    /// Maximum drift (pt) allowed while a long-press is held.
+    var longPressMaxDrift: Float = 12
+    /// Cooldown after a successful trigger (s) to avoid double-firing.
+    var cooldown: TimeInterval = 0.5
 
-    // MARK: - Callbacks
+    var hapticsEnabled = true
+    var backEnabled = true
+    var longPressEnabled = false
+    var preventSleep = false
 
-    /// Fired when a qualifying right-edge swipe completes.
-    var onRightEdgeSwipe: (() -> Void)?
-
-    /// Fired for every observed touch sample (for the live debug view).
-    /// (location in screen points, isProbablyDown)
-    var onTouchSample: ((CGPoint, Bool) -> Void)?
-
-    /// Fired when a back action is injected (for UI feedback).
-    var onBackInjected: (() -> Void)?
-
-    // MARK: - State
+    // MARK: - Private
 
     private var client: IOHIDEventSystemClientRef?
-    private var isObserving = false
-    private let workQueue = DispatchQueue(label: "touch.service.work", qos: .userInteractive)
+    private var dylib: UnsafeMutableRawPointer?
+    private var fallbackRecognizer: UIScreenEdgePanGestureRecognizer?
+    private var longPressTimer: Timer?
 
-    struct TouchTrack {
-        var startX: CGFloat
-        var startY: CGFloat
-        var startTime: CFTimeInterval
-        var lastX: CGFloat
-        var lastY: CGFloat
-        var lastTime: CFTimeInterval
-        var isRightEdge: Bool
-        var consumed: Bool
+    private typealias CreateFn = @convention(c) (CFAllocator?, UnsafeMutablePointer<IOHIDEventSystemClientRef?>) -> Int32
+    private typealias SetDispatchFn = @convention(c) (IOHIDEventSystemClientRef?, @convention(c) (UnsafeMutableRawPointer?, IOHIDEventRef?) -> Void, UnsafeMutableRawPointer?) -> Int32
+    private typealias DispatchEventFn = @convention(c) (IOHIDEventSystemClientRef?, IOHIDEventRef?) -> Int32
+    private typealias DigitizerFn = @convention(c) (CFAllocator?, UInt32, UInt32, UInt32, UInt32, UInt32, UInt32, Float32, Float32, Float32, Float32, UInt32) -> IOHIDEventRef?
+
+    private var fnCreate: CreateFn?
+    private var fnSetDispatch: SetDispatchFn?
+    private var fnDispatchEvent: DispatchEventFn?
+    private var fnDigitizer: DigitizerFn?
+
+    private var lastTriggerAt: Date = .distantPast
+    private var hapticEngine: CHHapticEngine?
+
+    /// One in-flight touch, keyed by the event's digitizer index (stable per
+    /// finger, unlike a synthetic id we would have to invent ourselves).
+    private struct TouchTrack {
+        var index: Int
+        var startX: Float
+        var startY: Float
+        var lastX: Float
+        var lastY: Float
+        var startTime: TimeInterval
+        var engaged: Bool
+        var triggered: Bool
+        var longPressFired: Bool
     }
     private var activeTouches: [Int: TouchTrack] = [:]
-    private var nextTouchID = 0
 
-    // IOKit HID field / type constants (private values).
-    private let kDigitizerType: UInt32 = 13            // kIOHIDEventTypeDigitizer
-    private let kFieldX: Int = 0x100000               // kIOHIDEventFieldDigitizerX
-    private let kFieldY: Int = 0x100001               // kIOHIDEventFieldDigitizerY
-    private let kSubBegin: UInt32 = 1                 // touch down
-    private let kSubMove: UInt32 = 3                 // move
-    private let kSubEnd: UInt32 = 2                 // touch up
-    private let kDigitizerTouch: UInt32 = 1          // kIOHIDEventDigitizerTypeTouch
+    /// Private digitizer sub-type values (not in the public headers).
+    private let kSubBegin: UInt32 = 1
+    private let kSubMove: UInt32 = 3
+    private let kSubEnd: UInt32 = 2
+    private let kDigitizerType: UInt32 = 13 // kIOHIDEventDigitizerTypeFinger
 
-    override init() {
-        super.init()
-    }
+    static let shared = TouchService()
 
-    deinit {
-        stopObserving()
-    }
+    // MARK: - Setup
 
-    // MARK: - Observation
-
-    /// Begin observing system-wide touch events. Safe to call repeatedly.
+    /// Load IOKit, resolve the private symbols, start observing. When the
+    /// private API is unavailable, falls back to a right-edge pan on our own
+    /// window so the gesture still works inside this app.
     @discardableResult
     func startObserving() -> Bool {
-        guard !isObserving else { return true }
-        var clientRef: IOHIDEventSystemClientRef?
-        let result = IOHIDEventSystemClientCreate(kCFAllocatorDefault, &clientRef)
-        guard result == KERN_SUCCESS, let clientRef = clientRef else {
-            print("[TouchService] IOHIDEventSystemClientCreate failed: \(result)")
-            return false
-        }
-        self.client = clientRef
-
-        let context = Unmanaged.passUnretained(self).toOpaque()
-        let setResult = IOHIDEventSystemClientSetEventDispatchFunction(
-            clientRef,
-            { ctx, event in
-                guard let ctx = ctx else { return }
-                let service = Unmanaged<TouchService>.fromOpaque(ctx).takeUnretainedValue()
-                service.handleEvent(event)
-            },
-            context
-        )
-        if setResult != KERN_SUCCESS {
-            print("[TouchService] SetEventDispatchFunction failed: \(setResult)")
-            return false
-        }
-        isObserving = true
-        print("[TouchService] Observing touch events")
-        return true
-    }
-
-    func stopObserving() {
-        guard isObserving else { return }
-        if let client = client {
-            IOHIDEventSystemClientSetEventDispatchFunction(client, nil, nil)
-            IOHIDEventSystemClientDestroy(client)
-        }
-        client = nil
-        isObserving = false
-        activeTouches.removeAll()
-        print("[TouchService] Stopped observing")
-    }
-
-    // MARK: - Event handling
-
-    private func handleEvent(_ event: IOHIDEventRef) {
-        let type = IOHIDEventGetEventType(event)
-        guard type.rawValue == kDigitizerType else { return }
-
-        let x = CGFloat(IOHIDEventGetFloatValue(event, kFieldX))
-        let y = CGFloat(IOHIDEventGetFloatValue(event, kFieldY))
-        guard x >= 0, y >= 0 else { return }
-
-        workQueue.async { [weak self] in
-            self?.processTouch(x: x, y: y)
-        }
-    }
-
-    private func processTouch(x: CGFloat, y: CGFloat) {
-        let now = CACurrentMediaTime()
-        let screen = UIScreen.main.bounds
-        let location = CGPoint(x: x, y: y)
-
-        // Report the sample for the debug view.
-        let isDown = activeTouches.isEmpty || nearestTouch(to: location) == nil
-        DispatchQueue.main.async { [weak self] in
-            self?.onTouchSample?(location, isDown)
-        }
-
-        // Find the nearest tracked touch.
-        var nearestKey: Int? = nil
-        var nearestDist: CGFloat = .infinity
-        for (key, track) in activeTouches {
-            let d = hypot(track.lastX - x, track.lastY - y)
-            if d < nearestDist {
-                nearestDist = d
-                nearestKey = key
-            }
-        }
-
-        if let key = nearestKey, nearestDist < 40 {
-            // Move: update the existing track.
-            if var track = activeTouches[key] {
-                track.lastX = x
-                track.lastY = y
-                track.lastTime = now
-                activeTouches[key] = track
-                checkSwipe(track)
+        if client != nil { return true }
+        loadSymbols()
+        if hidAvailable, let create = fnCreate, let setDispatch = fnSetDispatch {
+            var c: IOHIDEventSystemClientRef?
+            let kr = create(nil, &c)
+            if kr == 0, let client = c {
+                let kr2 = setDispatch(client, { ctx, event in
+                    guard let ctx = ctx else { return }
+                    let service = Unmanaged<TouchService>.fromOpaque(ctx).takeUnretainedValue()
+                    service.handleEvent(event)
+                }, Unmanaged.passUnretained(self).toOpaque())
+                if kr2 == 0 {
+                    self.client = client
+                    isObserving = true
+                    hidDetail = "live (system-wide)"
+                    startLongPressTimer()
+                    logEvent("HID observer live (system-wide)")
+                    return true
+                }
+                hidDetail = "set dispatch failed (kr=\(kr2))"
+            } else {
+                hidDetail = "client create failed (kr=\(kr))"
             }
         } else {
-            // New touch (begin).
-            nextTouchID += 1
-            let key = nextTouchID
-            let isRightEdge = x > (screen.width - edgeThreshold)
-            activeTouches[key] = TouchTrack(
-                startX: x, startY: y, startTime: now,
-                lastX: x, lastY: y, lastTime: now,
-                isRightEdge: isRightEdge, consumed: false
-            )
+            hidDetail = hidAvailable ? "symbols missing" : "symbols missing"
         }
-
-        // Drop stale touches.
-        activeTouches = activeTouches.filter { now - $0.value.lastTime < 0.6 }
+        // Fallback: foreground-only edge pan on our own window.
+        setupFallbackRecognizer()
+        return false
     }
 
-    private func nearestTouch(to p: CGPoint) -> TouchTrack? {
-        var best: TouchTrack? = nil
-        var bestD: CGFloat = .infinity
-        for track in activeTouches.values {
-            let d = hypot(track.lastX - p.x, track.lastY - p.y)
-            if d < bestD {
-                bestD = d
-                best = track
-            }
+    private func loadSymbols() {
+        let path = "/System/Library/Frameworks/IOKit.framework/IOKit"
+        dylib = dlopen(path, RTLD_LAZY)
+        guard dylib != nil else {
+            hidDetail = "dlopen failed"
+            return
         }
-        return best
+        fnCreate = symbol("IOHIDEventSystemClientCreate")
+        fnSetDispatch = symbol("IOHIDEventSystemClientSetEventDispatchFunction")
+        fnDispatchEvent = symbol("IOHIDEventSystemClientDispatchEvent")
+        fnDigitizer = symbol("IOHIDEventCreateDigitizerEvent")
+        hidAvailable = fnCreate != nil && fnSetDispatch != nil && fnDispatchEvent != nil && fnDigitizer != nil
+        hidDetail = hidAvailable ? "symbols resolved" : "symbols missing"
     }
 
-    private func checkSwipe(_ track: TouchTrack) {
-        guard track.isRightEdge, !track.consumed else { return }
-        let dx = track.startX - track.lastX   // positive when moved left
-        if dx > minSwipeDistance {
-            // Qualifying right-edge swipe.
-            if backEnabled {
-                injectLeftEdgeSwipe()
-            }
-            // Mark consumed so a single swipe only triggers once.
-            if var t = activeTouches.first(where: { $0.value.startX == track.startX && $0.value.startY == track.startY }) {
-                t.value.consumed = true
-                activeTouches[t.key] = t.value
-            }
+    private func symbol<T>(_ name: String) -> T? {
+        guard let handle = dlsym(dylib, name) else { return nil }
+        return unsafeBitCast(handle, to: T.self)
+    }
+
+    private func setupFallbackRecognizer() {
+        guard fallbackRecognizer == nil else { return }
+        let recognizer = UIScreenEdgePanGestureRecognizer(target: self, action: #selector(handleFallbackPan(_:)))
+        recognizer.edges = .right
+        DispatchQueue.main.async {
+            guard let window = UIApplication.shared.connectedScenes
+                .compactMap({ $0 as? UIWindowScene })
+                .first?.keyWindow else { return }
+            window.addGestureRecognizer(recognizer)
+        }
+        fallbackRecognizer = recognizer
+        if isObserving == false {
+            isObserving = true
+            hidDetail = "fallback (in-app only)"
+        }
+        logEvent("HID unavailable — in-app fallback active")
+    }
+
+    // MARK: - Unified gesture model
+
+    private func beginTouch(index: Int, x: Float, y: Float) {
+        let now = CACurrentMediaTime()
+        let inEdge = x >= UIScreen.main.bounds.width - CGFloat(edgeThreshold)
+        activeTouches[index] = TouchTrack(
+            index: index, startX: x, startY: y, lastX: x, lastY: y,
+            startTime: now, engaged: false, triggered: false, longPressFired: false
+        )
+        if inEdge {
+            engageTick()
+            setEdgeIndicator(active: true, progress: 0)
+            logEvent("edge begin x=\(Int(x)) y=\(Int(y))")
         }
     }
+
+    private func moveTouch(index: Int, x: Float, y: Float) {
+        guard var track = activeTouches[index], !track.triggered else { return }
+        let inEdge = track.startX >= UIScreen.main.bounds.width - CGFloat(edgeThreshold)
+        guard inEdge else { return }
+        track.lastX = x
+        track.lastY = y
+        activeTouches[index] = track
+        checkEngage(track)
+        checkLongPress(track)
+        // Grow the edge indicator with the swipe (Android's drag indicator).
+        let dx = x - track.startX
+        let progress = min(max(-dx / completeDistance, 0), 1)
+        setEdgeIndicator(active: true, progress: progress)
+    }
+
+    private func endTouch(index: Int) {
+        guard let track = activeTouches[index] else { return }
+        activeTouches.removeValue(forKey: index)
+        setEdgeIndicator(active: false, progress: 0)
+        guard !track.triggered else { return }
+        evaluateRelease(track)
+    }
+
+    /// Android's engagement: crossing the engage distance gives a firmer tick
+    /// (the moment Android's drag indicator "locks in").
+    private func checkEngage(_ track: TouchTrack) {
+        guard !track.engaged else { return }
+        let dx = track.lastX - track.startX
+        guard dx < 0, -dx >= engageDistance, abs(track.lastY - track.startY) <= maxVerticalDrift else { return }
+        if var t = activeTouches[track.index] {
+            t.engaged = true
+            activeTouches[track.index] = t
+        }
+        engageTick()
+        logEvent("edge engaged")
+    }
+
+    /// Android's long-press-edge: hold in the edge zone, minimal drift.
+    private func checkLongPress(_ track: TouchTrack) {
+        guard longPressEnabled, !track.longPressFired, !track.triggered else { return }
+        let held = CACurrentMediaTime() - track.startTime
+        let drift = hypot(CGFloat(track.lastX - track.startX), CGFloat(track.lastY - track.startY))
+        guard held >= longPressDuration, drift <= longPressMaxDrift else { return }
+        if var t = activeTouches[track.index] {
+            t.longPressFired = true
+            t.triggered = true
+            activeTouches[track.index] = t
+        }
+        activeTouches.removeValue(forKey: track.index)
+        fireHome()
+    }
+
+    /// Android's completion: release past the distance threshold, or a fast
+    /// flick. The injected swipe is paced to the user's actual swipe time.
+    private func evaluateRelease(_ track: TouchTrack) {
+        guard backEnabled else { return }
+        let dx = track.lastX - track.startX
+        let dy = track.lastY - track.startY
+        guard dx < 0 else { return }
+        guard abs(dy) <= maxVerticalDrift else { return }
+        let elapsed = max(CACurrentMediaTime() - track.startTime, 0.001)
+        let velocity = -dx / elapsed
+        let byDistance = -dx >= completeDistance
+        let byFlick = velocity >= flickVelocity
+        guard byDistance || byFlick else {
+            logEvent("edge cancelled (dist \(Int(-dx))pt, vel \(Int(velocity))pt/s)")
+            return
+        }
+        guard Date().timeIntervalSince(lastTriggerAt) >= cooldown else { return }
+        lastTriggerAt = Date()
+        // Pace the synthetic swipe to the user's actual swipe time (Android
+        // feel: the native animation follows the pace of your finger).
+        let duration = min(max(elapsed, 0.12), 0.4)
+        fireBack(duration: duration)
+    }
+
+    // MARK: - Triggers
+
+    private func fireBack(duration: CFTimeInterval) {
+        injectSwipe(edge: .left, duration: duration)
+        lastBackAt = Date()
+        logEvent("back triggered (paced \(Int(duration * 1000))ms)")
+        successTick()
+    }
+
+    private func fireHome() {
+        injectSwipe(edge: .bottom, duration: 0.25)
+        lastHomeAt = Date()
+        logEvent("home triggered (long-press edge)")
+        successTick()
+    }
+
+    /// Convenience for the UI test buttons.
+    func testBack() { fireBack(duration: 0.2) }
+    func testHome() { fireHome() }
 
     // MARK: - Injection
 
-    /// Inject a synthetic left-edge swipe to trigger the native back gesture.
-    func injectLeftEdgeSwipe() {
-        guard let client = client else {
-            print("[TouchService] No client for injection")
+    /// Inject a synthetic system gesture: a left-edge swipe (iOS's native
+    /// "back") or a bottom-edge swipe (iOS's native "home / app switcher"),
+    /// paced to `duration` seconds.
+    func injectSwipe(edge: Edge, duration: CFTimeInterval) {
+        guard let digitizer = fnDigitizer, let dispatch = fnDispatchEvent, let client = client else {
+            // Fallback path: the private API is gone, so only the in-app
+            // gesture works; report it and stop here.
+            logEvent("inject skipped (HID unavailable)")
             return
         }
-        let screen = UIScreen.main.bounds
-        let startY = screen.height * 0.5
-
-        // HID timestamps are 32-bit microseconds.
-        let base = UInt32((CACurrentMediaTime() * 1_000_000)
-            .truncatingRemainder(dividingBy: 4_294_967_296))
-        let step: UInt32 = 8_000   // 8 ms between events
-
-        // 1. Touch down at the left edge.
-        dispatchDigitizer(client, timestamp: base, subType: kSubBegin,
-                         x: 0, y: startY, inRange: true)
-        // 2. Move right (the native back gesture direction).
-        for i in 1...12 {
-            let x = CGFloat(i) * 18
-            dispatchDigitizer(client,
-                             timestamp: base + UInt32(i) * step,
-                             subType: kSubMove, x: x, y: startY, inRange: true)
+        let w = Float(UIScreen.main.bounds.width)
+        let h = Float(UIScreen.main.bounds.height)
+        let begin = CACurrentMediaTime()
+        var points: [(Float, Float)] = []
+        if edge == .left {
+            let midY = h / 2
+            points = [(2, midY), (8, midY), (20, midY), (40, midY), (70, midY), (110, midY), (150, midY), (max(180, w * 0.35), midY)]
+        } else {
+            let midX = w / 2
+            points = [(midX, h - 2), (midX, h - 8), (midX, h - 20), (midX, h - 40), (midX, h - 70), (midX, h - 110), (midX, h - 150), (midX, h - max(180, h * 0.35))]
         }
-        // 3. Touch up.
-        dispatchDigitizer(client,
-                         timestamp: base + 13 * step,
-                         subType: kSubEnd, x: 220, y: startY, inRange: false)
+        let n = CFTimeInterval(points.count)
+        for (i, p) in points.enumerated() {
+            let sub: UInt32 = i == 0 ? kSubBegin : (i == points.count - 1 ? kSubEnd : kSubMove)
+            // Ease-out timing: fast start, gentle finish (like a real finger).
+            let f = CFTimeInterval(i) / n
+            let eased = 1 - pow(1 - f, 2)
+            let t = duration * eased
+            let ev = digitizer(nil, UInt32((begin + t) * 1_000_000), 13, sub, 0, 0, kDigitizerType, p.0, p.1, 0, 1, 0)
+            if let ev = ev { dispatch(client, ev) }
+        }
+        print("EdgeReturn: injected \(edge == .left ? "back" : "home") swipe")
+    }
 
+    enum Edge { case left, bottom }
+
+    // MARK: - HID event handling
+
+    private func handleEvent(_ event: IOHIDEventRef?) {
+        guard let event = event else { return }
+        let type = IOHIDEventGetEventType(event)
+        guard type == IOHIDEventTypeDigitizer else { return }
+        let subType = IOHIDEventGetIntegerValue(event, kIOHIDEventFieldDigitizerSubType)
+        let x = Float(IOHIDEventGetFloatValue(event, kIOHIDEventFieldDigitizerX))
+        let y = Float(IOHIDEventGetFloatValue(event, kIOHIDEventFieldDigitizerY))
+        let index = Int(IOHIDEventGetIntegerValue(event, kIOHIDEventFieldDigitizerIndex))
+
+        switch subType {
+        case Int32(kSubBegin):
+            beginTouch(index: index, x: x, y: y)
+        case Int32(kSubMove):
+            moveTouch(index: index, x: x, y: y)
+        case Int32(kSubEnd):
+            endTouch(index: index)
+        default:
+            break
+        }
+    }
+
+    // MARK: - Fallback recognizer (in-app only)
+
+    @objc private func handleFallbackPan(_ recognizer: UIScreenEdgePanGestureRecognizer) {
+        guard !hidAvailable else { return }
+        let location = recognizer.location(in: nil)
+        switch recognizer.state {
+        case .began:
+            beginTouch(index: 0, x: Float(location.x), y: Float(location.y))
+        case .changed:
+            moveTouch(index: 0, x: Float(location.x), y: Float(location.y))
+        case .ended, .cancelled, .failed:
+            endTouch(index: 0)
+        default:
+            break
+        }
+    }
+
+    // MARK: - Long-press timer (fires even when the finger is perfectly still)
+
+    private func startLongPressTimer() {
+        longPressTimer?.invalidate()
+        let t = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            // Snapshot first: checkLongPress mutates activeTouches.
+            for track in self.activeTouches.values {
+                self.checkLongPress(track)
+            }
+        }
+        RunLoop.main.add(t, for: .common)
+        longPressTimer = t
+    }
+
+    // MARK: - Haptics (best effort, foreground only)
+
+    private func engageTick() {
+        guard hapticsEnabled else { return }
+        playIntensity(0.35, sharpness: 0.8, duration: 0.04)
+    }
+
+    private func successTick() {
+        guard hapticsEnabled else { return }
+        playIntensity(0.6, sharpness: 0.9, duration: 0.08)
+    }
+
+    private func playIntensity(_ intensity: Float, sharpness: Float, duration: TimeInterval) {
         DispatchQueue.main.async { [weak self] in
-            self?.onBackInjected?()
+            guard let self = self else { return }
+            if self.hapticEngine == nil {
+                self.hapticEngine = try? CHHapticEngine()
+            }
+            guard let engine = self.hapticEngine else { return }
+            engine.start()
+            let event = CHHapticEvent(eventType: .hapticTypeSteadyState, parameters: [
+                CHHapticEventParameter(parameterID: .hapticIntensityControl, value: intensity),
+                CHHapticEventParameter(parameterID: .hapticSharpnessControl, value: sharpness)
+            ], duration: duration)
+            let pattern = try? CHHapticPattern(events: [event], duration: duration + 0.02)
+            try? engine.play(pattern)
         }
-        print("[TouchService] Injected left-edge swipe (back)")
     }
 
-    private func dispatchDigitizer(_ client: IOHIDEventSystemClientRef,
-                                  timestamp: UInt32, subType: UInt32,
-                                  x: CGFloat, y: CGFloat, inRange: Bool) {
-        guard let event = IOHIDEventCreateDigitizerEvent(
-            kCFAllocatorDefault,
-            timestamp,
-            kDigitizerType,
-            subType,
-            0,            // index
-            inRange ? 1 : 0,   // range
-            kDigitizerTouch,
-            Float32(x),
-            Float32(y),
-            0,            // z
-            inRange ? 1.0 : 0.0,  // v (pressure)
-            0             // options
-        ) else { return }
-        IOHIDEventSystemClientDispatchEvent(client, event)
-        CFRelease(event)
+    // MARK: - Edge indicator + event log (UI, main thread)
+
+    private func setEdgeIndicator(active: Bool, progress: Double) {
+        DispatchQueue.main.async { [weak self] in
+            self?.edgeTouchActive = active
+            self?.edgeTouchProgress = max(0, min(progress, 1))
+        }
     }
 
-    // MARK: - Diagnostics
-
-    /// Force a single back injection (for the "Test back" button).
-    func testBack() {
-        _ = startObserving()
-        injectLeftEdgeSwipe()
+    private func logEvent(_ message: String) {
+        let stamp = Date().formatted(date: .omitted, time: .standard)
+        let line = "[\(stamp)] \(message)"
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.eventLog.insert(line, at: 0)
+            if self.eventLog.count > 8 {
+                self.eventLog.removeLast(self.eventLog.count - 8)
+            }
+        }
     }
-
-    var observing: Bool { isObserving }
 }

@@ -20,3 +20,6 @@ DerivedData/
 
 # Logs
 *.log
+
+# Signing working dir (certs, b64, logs)
+signing/
